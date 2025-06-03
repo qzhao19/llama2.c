@@ -138,6 +138,40 @@ public:
 };
 
 // ----------------------------------------------------------------------------
+// Tokennizer
+
+struct TokenIndex {
+    std::string str;
+    int id;
+};
+using TokenIndexType = TokenIndex;
+
+struct TokenizerData {
+    std::vector<std::vector<char>> vocab;
+    std::vector<TokenIndexType> sorted_vocab;
+    std::vector<float> vocab_scores;
+    int vocab_size;
+    unsigned int max_token_length;
+    unsigned char byte_pieces[512]; // stores all single-byte strings
+};
+using TokenizerDataType = TokenizerData ;
+
+class Tokenizer {
+private:
+    std::unique_ptr<TokenizerDataType> tokenizer_data_;
+public:
+    Tokenizer() {
+        tokenizer_data_ = std::make_unique<TokenizerDataType>();
+    };
+    ~Tokenizer() {};
+
+    void build_tokenizer(std::string_view tokenizer_path, int vocab_size);
+    void encode(const std::string &text, const int8_t &bos, const int8_t &eos, std::vector<int> &tokens, int &n_tokens);
+    std::string decode(int prev_token, int token);
+};
+
+
+// ----------------------------------------------------------------------------
 // Transformer model
 
 class Transformer {
