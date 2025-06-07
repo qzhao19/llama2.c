@@ -116,9 +116,9 @@ public:
     ModelManager& operator=(const ModelManager&) = delete;
     
     // move ModelManager owner priority to caller 
-    std::unique_ptr<ConfigType> config() { return std::move(config_); }
-    std::unique_ptr<RunStateType> state() { return std::move(state_); }
-    std::unique_ptr<TransformerWeightsType> weight() { return std::move(weight_); }
+    std::unique_ptr<ConfigType> release_config() { return std::move(config_); }
+    std::unique_ptr<RunStateType> release_state() { return std::move(state_); }
+    std::unique_ptr<TransformerWeightsType> release_weight() { return std::move(weight_); }
     
     // ptrs to visit data, but not use   
     ConfigType* config_ptr() { return config_.get(); }
@@ -143,18 +143,44 @@ public:
 struct TokenIndex {
     std::string str;
     int id;
+    // overload operator '<'
+    bool operator<(const TokenIndex& other) const {
+        return str < other.str;
+    }
 };
 using TokenIndexType = TokenIndex;
 
 struct TokenizerData {
-    std::vector<std::vector<char>> vocab;
+    std::vector<std::unique_ptr<char[]>> vocab;
     std::vector<TokenIndexType> sorted_vocab;
     std::vector<float> vocab_scores;
     int vocab_size;
     unsigned int max_token_length;
     unsigned char byte_pieces[512]; // stores all single-byte strings
 };
-using TokenizerDataType = TokenizerData ;
+using TokenizerDataType = TokenizerData;
+
+inline int string_lookup(const std::string& str, 
+                         const int vocab_size,
+                         const std::vector<TokenIndexType>& sorted_vocab) {
+    // efficiently find the perfect match for str in vocab, return its index or -1 if not found
+    TokenIndexType tok = {.str = str, 
+                          .id = -1};
+
+    // cannot use std::lower_bound function ?
+    // auto iter = std::lower_bound(sorted_vocab.begin(), sorted_vocab.end(), tok);
+    auto cmp = [](const void *a, const void *b) {
+        const TokenIndexType* ta = static_cast<const TokenIndexType*>(a);
+        const TokenIndexType* tb = static_cast<const TokenIndexType*>(b);
+        return strcmp(ta->str.c_str(), tb->str.c_str());
+    };
+
+    // If we didn't reach the end and the string matches
+    TokenIndexType *matched_string = static_cast<TokenIndexType*>(
+        bsearch(&tok, sorted_vocab.data(), vocab_size, sizeof(TokenIndexType), cmp)
+    );
+    return matched_string != nullptr ? matched_string->id : -1;
+}
 
 class Tokenizer {
 private:
@@ -166,7 +192,7 @@ public:
     ~Tokenizer() {};
 
     void build_tokenizer(std::string_view tokenizer_path, int vocab_size);
-    void encode(const std::string &text, const int8_t &bos, const int8_t &eos, std::vector<int> &tokens, int &n_tokens);
+    void encode(const std::string &text, const int8_t &bos, const int8_t &eos, std::vector<int> &tokens, int &num_tokens);
     std::string decode(int prev_token, int token);
 };
 
