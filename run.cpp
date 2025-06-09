@@ -1,3 +1,4 @@
+#include "gemm.hpp"
 #include "run.hpp"
 int GS = 0;
 
@@ -328,6 +329,102 @@ std::string Tokenizer::decode(int prev_token, int token) {
         piece = (char*)tokenizer_data_->byte_pieces + byte_val * 2;
     }
     return std::string(piece);
+}
+
+// ----------------------------------------------------------------------------
+// Sampler
+
+int Sampler::sample_argmax(const std::vector<float> &proba) {
+    // return the index that has the highest probability
+    auto iter = std::max_element(proba.begin(), proba.end());
+    return std::distance(proba.begin(), iter);
+}
+
+int Sampler::sample_mult(const std::vector<float> &proba, float coin) {
+    // sample index from probabilities (they must sum to 1!)
+    // coin is a random number in [0, 1), usually from random_f32()
+    float cdf = 0.0f;
+    for (int i = 0; i < vocab_size_; i++) {
+        cdf += proba[i];
+        if (coin < cdf) {
+            return i;
+        }
+    }
+    return vocab_size_ - 1; // in case of rounding errors
+}
+
+int Sampler::sample_topp(const std::vector<float> &proba, float coin) {
+    // top-p sampling (or "nucleus sampling") samples from the smallest set of
+    // tokens that exceed probability topp. This way we never sample tokens that
+    // have very low probabilities and are less likely to go "off the rails".
+    // coin is a random number in [0, 1), usually from random_f32()
+
+    int n0 = 0;
+    // quicksort indices in descending order of probabilities
+    // values smaller than (1 - topp) / (n - 1) cannot be part of the result
+    // so for efficiency we crop these out as candidates before sorting
+    const float cutoff = (1.0f - topp_) / (vocab_size_ - 1);
+    for (int i = 0; i < vocab_size_; i++) {
+        if (proba[i] >= cutoff) {
+            proba_index_[n0].index = i;
+            proba_index_[n0].proba = proba[i];
+            n0++;
+        }
+    }
+    std::sort(proba_index_.begin(), proba_index_.end(), 
+            [](const ProbaIndexType& a, const ProbaIndexType& b) -> bool {
+                return a.proba > b.proba;
+            });
+    
+    // truncate the list where cumulative probability exceeds topp
+    float cumulative_prob = 0.0f;
+    int last_idx = n0 - 1; // in case of rounding errors consider all elements
+    for (int i = 0; i < n0; i++) {
+        cumulative_prob += proba_index_[i].proba;
+        if (cumulative_prob > topp_) {
+            last_idx = i;
+            break; // we've exceeded topp by including last_idx
+        }
+    }
+
+    // sample from the truncated list
+    float r = coin * cumulative_prob;
+    float cdf = 0.0f;
+    for (int i = 0; i <= last_idx; i++) {
+        cdf += proba_index_[i].proba;
+        if (r < cdf) {
+            return proba_index_[i].index;
+        }
+    }
+    return proba_index_[last_idx].index; // in case of rounding errors
+}
+
+int Sampler::sample(std::vector<float> &logits) {
+    // sample the token given the logits and some hyperparameters
+    int next;
+    if (temperature_ == 0.0f) {
+        // greedy argmax sampling: take the token with the highest probability
+        next = sample_argmax(logits, vocab_size_);
+    } else {
+        // apply the temperature to the logits
+        for (int q=0; q < vocab_size_; q++) { 
+            logits[q] /= temperature_; 
+        }
+        // apply softmax to the logits to get the probabilities for next token
+        softmax(logits, vocab_size_);
+        // flip a (float) coin (this is our source of entropy for sampling)
+        float coin = random_f32(&rng_state_);
+        // we sample from this distribution to get the next token
+        if (topp_ <= 0 || topp_ >= 1) {
+            // simply sample from the predicted probability distribution
+            next = sample_mult(logits, coin);
+        } 
+        else {
+            // top-p (nucleus) sampling, clamping the least likely tokens to zero
+            next = sample_topp(logits, coin);
+        }
+    }
+    return next;
 }
 
 // ----------------------------------------------------------------------------
