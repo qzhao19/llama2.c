@@ -198,6 +198,60 @@ public:
 
 
 // ----------------------------------------------------------------------------
+// The Sampler, which takes logits and returns a sampled token
+// sampling can be done in a few ways: greedy argmax, sampling, top-p sampling
+
+// struct used when sorting probabilities during top-p sampling
+struct ProbaIndex {
+    float proba;
+    int index;
+};
+using ProbaIndexType = ProbaIndex;
+
+class Sampler {
+private:
+    std::vector<ProbaIndexType> proba_index_; // buffer used in top-p sampling
+    int vocab_size_;
+    float temperature_;
+    float topp_;
+    unsigned long long rng_state_;
+
+    int sample_argmax(const std::vector<float> &proba);
+    int sample_mult(const std::vector<float> &proba, float coin);
+    int sample_topp(const std::vector<float> &proba, float coin);
+    
+    unsigned int random_u32(unsigned long long *state) {
+        // xorshift rng: https://en.wikipedia.org/wiki/Xorshift#xorshift.2A
+        *state ^= *state >> 12;
+        *state ^= *state << 25;
+        *state ^= *state >> 27;
+        return (*state * 0x2545F4914F6CDD1Dull) >> 32;
+    }
+
+    float random_f32(unsigned long long *state) { // random float32 in [0,1)
+        return (random_u32(state) >> 8) / 16777216.0f;
+    }
+    
+public:
+    Sampler(int vocab_size, 
+        float temperature, 
+        float topp, 
+        unsigned long long rng_state) : vocab_size_(vocab_size),
+            temperature_(temperature), 
+            topp_(topp), 
+            rng_state_(rng_state) {
+        proba_index_.resize(vocab_size);
+    }
+
+    ~Sampler() = default;
+
+    // void build_sampler(int vocab_size, float temperature, float topp, unsigned long long rng_seed);
+    int sample(const std::vector<float> &logits);
+
+};
+
+
+// ----------------------------------------------------------------------------
 // Transformer model
 
 class Transformer {
