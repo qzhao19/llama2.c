@@ -27,7 +27,37 @@
 extern int GS;
 
 // ----------------------------------------------------------------------------
-// Model loading
+// Utility function
+
+inline long time_in_ms() {
+    // return time in milliseconds, for benchmarking the model speed
+    auto now = std::chrono::system_clock::now().time_since_epoch();
+    return std::chrono::duration_cast<std::chrono::milliseconds>(now).count();
+}
+
+inline void safe_print(const std::string& piece) {
+    if (piece.empty()) {
+        return;
+    }
+    if (piece.size() == 1) {
+        unsigned char byte_val = piece[0];
+        if (!(isprint(byte_val) || isspace(byte_val))) {
+            return; // bad byte, don't print it
+        }
+    }
+    std::cout << piece;
+}
+
+inline void read_stdin(const std::string& guide, std::string& buffer, size_t max_len) {
+    std::cout << guide;
+    std::getline(std::cin, buffer);
+    if(buffer.length() > max_len) {
+        buffer.resize(max_len);
+    }
+}
+
+// ----------------------------------------------------------------------------
+// struct definitions
 
 // store params of transformer model 
 struct Config {
@@ -89,53 +119,13 @@ using ConfigType = Config;
 using RunStateType = RunState;
 using TransformerWeightsType = TransformerWeights;
 
-// manager model loading
-class ModelManager {
-private:
-    bool shared_weights_;
-    std::unique_ptr<ConfigType> config_;
-    std::unique_ptr<RunStateType> state_;
-    std::unique_ptr<TransformerWeightsType> weight_;
-    void malloc_weights();
-    void malloc_run_state();
-    // private
-    ModelManager(): shared_weights_(true) {
-        config_ = std::make_unique<ConfigType>();
-        state_ = std::make_unique<RunStateType>();
-        weight_ = std::make_unique<TransformerWeightsType>();
-    };
-    ~ModelManager() = default;
-
-public:
-    static ModelManager& get_instance() {
-        static ModelManager model_manager;
-        return model_manager;
-    }
-
-    ModelManager(const ModelManager&) = delete;
-    ModelManager& operator=(const ModelManager&) = delete;
-    
-    // move ModelManager owner priority to caller 
-    std::unique_ptr<ConfigType> release_config() { return std::move(config_); }
-    std::unique_ptr<RunStateType> release_state() { return std::move(state_); }
-    std::unique_ptr<TransformerWeightsType> release_weight() { return std::move(weight_); }
-    
-    // ptrs to visit data, but not use   
-    ConfigType* config_ptr() { return config_.get(); }
-    RunStateType* state_ptr() { return state_.get(); }
-    TransformerWeightsType* weights_ptr() { return weight_.get(); }
-    const ConfigType* config_ptr() const { return config_.get(); }
-    const RunStateType* state_ptr() const { return state_.get(); }
-    const TransformerWeightsType* weights_ptr() const { return weight_.get(); }
-    
-    // load model
-    void load(std::string_view ckpt_path);
-    void reset() {
-        config_ = std::make_unique<ConfigType>();
-        state_ = std::make_unique<RunStateType>();
-        weight_ = std::make_unique<TransformerWeightsType>();
-    }
+// transformer model
+struct TransformerModel {
+    std::unique_ptr<ConfigType> config;
+    std::unique_ptr<RunStateType> state;
+    std::unique_ptr<TransformerWeightsType> weight;
 };
+using TransformerModelType = TransformerModel;
 
 // ----------------------------------------------------------------------------
 // Tokennizer
@@ -185,17 +175,18 @@ inline int string_lookup(const std::string& str,
 class Tokenizer {
 private:
     std::unique_ptr<TokenizerDataType> tokenizer_data_;
+    void build_tokenizer(std::string_view tokenizer_path, int vocab_size);
+
 public:
-    Tokenizer() {
+    Tokenizer(std::string_view tokenizer_path, int vocab_size) {
         tokenizer_data_ = std::make_unique<TokenizerDataType>();
+        build_tokenizer(tokenizer_path, vocab_size);
     };
     ~Tokenizer() {};
 
-    void build_tokenizer(std::string_view tokenizer_path, int vocab_size);
     void encode(const std::string &text, const int8_t &bos, const int8_t &eos, std::vector<int> &tokens, int &num_tokens);
     std::string decode(int prev_token, int token);
 };
-
 
 // ----------------------------------------------------------------------------
 // The Sampler, which takes logits and returns a sampled token
@@ -246,28 +237,48 @@ public:
     ~Sampler() = default;
 
     // void build_sampler(int vocab_size, float temperature, float topp, unsigned long long rng_seed);
-    int sample(const std::vector<float> &logits);
+    int sample(std::vector<float> &logits);
 
 };
-
 
 // ----------------------------------------------------------------------------
 // Transformer model
 
 class Transformer {
 private:
+    bool shared_weights_;
     std::unique_ptr<ConfigType> config_;
     std::unique_ptr<RunStateType> state_;
     std::unique_ptr<TransformerWeightsType> weight_;
+    std::unique_ptr<TransformerModelType> model_;
+    void malloc_weights();
+    void malloc_run_state();
 
 public:
-    Transformer() = default;
+    explicit Transformer(bool shared_weights): shared_weights_(shared_weights) {
+        config_ = std::make_unique<ConfigType>();
+        state_ = std::make_unique<RunStateType>();
+        weight_ = std::make_unique<TransformerWeightsType>();
+        model_ = std::make_unique<TransformerModelType>();
+    };
+
+    Transformer(): shared_weights_(true) {
+        config_ = std::make_unique<ConfigType>();
+        state_ = std::make_unique<RunStateType>();
+        weight_ = std::make_unique<TransformerWeightsType>();
+        model_ = std::make_unique<TransformerModelType>();
+    };
     ~Transformer() = default;
     
     void load_model(std::string_view ckpt_path);
     
     std::vector<float> forward(int token, int pos);
+
+    int get_vocab_size() const { return model_->config->vocab_size; }
+
+    int get_seq_len() const { return model_->config->seq_len; }
 };
+
 
 
 #endif // RUN_HPP_
