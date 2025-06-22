@@ -1,6 +1,9 @@
 #ifndef GEMM_HPP_
 #define GEMM_HPP_
 
+#include <cmath>
+#include <cstring>
+
 #undef MIN
 #undef MAX
 
@@ -110,184 +113,227 @@ inline __m256 load(const float *p) {
 }
 #endif // __AVX__
 
-/**
- * 
- */
-template<int KN, typename D, typename V, typename TA, typename TB, typename TC>
-class tinyBLAS {
-    public:
-    tinyBLAS(int64_t k,
-             const TA *A, int64_t lda,
-             const TB *B, int64_t ldb,
-             TC *C, int64_t ldc,
-             int ith, int nth)
-        : A(A), B(B), C(C), k(k), lda(lda), ldb(ldb), ldc(ldc), ith(ith), nth(nth) {
+// 添加set1函数定义
+#if defined(USE_SSE)
+inline __m128 set1(float x) { return _mm_set1_ps(x); }
+#endif
+
+#if defined(USE_AVX)
+inline __m256 set1(float x) { return _mm256_set1_ps(x); }
+#endif
+
+#define MEMORY_ALIGNMENT 32
+
+inline void rmsnorm(float* o, float* x, float* weight, int size) {
+    // calculate sum of squares
+    // variance 
+    float ss = 0.0f;
+    for (int j = 0; j < size; j++) {
+        ss += x[j] * x[j];
     }
-
-    void matmul(int64_t m, int64_t n) {
-        mnpack(0, m, 0, n);
+    ss /= size;
+    // 1 / sqrt(variance + epsilon)
+    ss += 1e-5f;
+    ss = 1.0f / sqrtf(ss);
+    // normalize and scale
+    for (int j = 0; j < size; j++) {
+        o[j] = weight[j] * (ss * x[j]);
     }
-
-    private:
-    NOINLINE void mnpack(int64_t m0, int64_t m, int64_t n0, int64_t n) {
-        int64_t mc, nc, mp, np;
-        switch ((MIN(m - m0, 5) << 4) | MIN(n - n0, 5)) {
-            case 0x55:
-            case 0x54:
-            case 0x53:
-            case 0x45:
-            case 0x44:
-            case 0x43:
-                mc = 4;
-                nc = 3;
-                gemm<4, 3>(m0, m, n0, n);
-                break;
-            case 0x35:
-            case 0x34:
-                mc = 3;
-                nc = 4;
-                gemm<3, 4>(m0, m, n0, n);
-                break;
-            case 0x52:
-                mc = 5;
-                nc = 2;
-                gemm<5, 2>(m0, m, n0, n);
-                break;
-            case 0x33:
-                mc = 3;
-                nc = 3;
-                gemm<3, 3>(m0, m, n0, n);
-                break;
-            case 0x25:
-                mc = 2;
-                nc = 5;
-                gemm<2, 5>(m0, m, n0, n);
-                break;
-            case 0x42:
-                mc = 4;
-                nc = 2;
-                gemm<4, 2>(m0, m, n0, n);
-                break;
-            case 0x24:
-                mc = 2;
-                nc = 4;
-                gemm<2, 4>(m0, m, n0, n);
-                break;
-            case 0x32:
-                mc = 3;
-                nc = 2;
-                gemm<3, 2>(m0, m, n0, n);
-                break;
-            case 0x23:
-                mc = 2;
-                nc = 3;
-                gemm<2, 3>(m0, m, n0, n);
-                break;
-            case 0x51:
-                mc = 5;
-                nc = 1;
-                gemm<5, 1>(m0, m, n0, n);
-                break;
-            case 0x41:
-                mc = 4;
-                nc = 1;
-                gemm<4, 1>(m0, m, n0, n);
-                break;
-            case 0x22:
-                mc = 2;
-                nc = 2;
-                gemm<2, 2>(m0, m, n0, n);
-                break;
-            case 0x15:
-                mc = 1;
-                nc = 5;
-                gemm<1, 5>(m0, m, n0, n);
-                break;
-            case 0x14:
-                mc = 1;
-                nc = 4;
-                gemm<1, 4>(m0, m, n0, n);
-                break;
-            case 0x31:
-                mc = 3;
-                nc = 1;
-                gemm<3, 1>(m0, m, n0, n);
-                break;
-            case 0x13:
-                mc = 1;
-                nc = 3;
-                gemm<1, 3>(m0, m, n0, n);
-                break;
-            case 0x21:
-                mc = 2;
-                nc = 1;
-                gemm<2, 1>(m0, m, n0, n);
-                break;
-            case 0x12:
-                mc = 1;
-                nc = 2;
-                gemm<1, 2>(m0, m, n0, n);
-                break;
-            case 0x11:
-                mc = 1;
-                nc = 1;
-                gemm<1, 1>(m0, m, n0, n);
-                break;
-            default:
-                return;
-        }
-        mp = m0 + (m - m0) / mc * mc;
-        np = n0 + (n - n0) / nc * nc;
-        mnpack(mp, m, n0, np);
-        mnpack(m0, m, np, n);
-    }
-
-    template <int RM, int RN>
-    NOINLINE void gemm(int64_t m0, int64_t m, int64_t n0, int64_t n) {
-        // std::cout << "RM = "<< RM << ", RN = "<< RN << std::endl;
-        int64_t ytiles = (m - m0) / RM;
-        int64_t xtiles = (n - n0) / RN;
-        int64_t tiles = xtiles * ytiles;
-        // std::cout << "ytiles = "<< ytiles << ", xtiles = "<< xtiles << std::endl;
-        // std::cout << "tiles = "<< tiles << std::endl;
-        int64_t duty = (tiles + nth - 1) / nth;
-        int64_t start = duty * ith;
-        int64_t end = start + duty;
-
-        if (end > tiles)
-            end = tiles;
-        for (int64_t job = start; job < end; ++job) {
-            int64_t ii = m0 + job / xtiles * RM;
-            int64_t jj = n0 + job % xtiles * RN;
-            D Cv[RN][RM] = {};
-            for (int64_t l = 0; l < k; l += KN)
-                for (int64_t j = 0; j < RN; ++j)
-                    for (int64_t i = 0; i < RM; ++i)
-                        Cv[j][i] = madd(
-                            load<V>(A + lda * (ii + i) + l),
-                            load<V>(B + ldb * (jj + j) + l),
-                            // load<V>(A + (ii + i) + l * lda),
-                            // load<V>(B + l + (jj + j) * ldb),
-                            Cv[j][i]
-                        );
-            for (int64_t j = 0; j < RN; ++j)
-                for (int64_t i = 0; i < RM; ++i)
-                    // C[ldc * (jj + j) + (ii + i)] = hsum(Cv[j][i]);
-                    C[(ii + i) + (jj + j) * ldc] = hsum(Cv[j][i]);
-        }
-    }
-
-    const TA *const A;
-    const TB *const B;
-    TC *const C;
-    const int64_t k;
-    const int64_t lda;
-    const int64_t ldb;
-    const int64_t ldc;
-    const int ith;
-    const int nth;
-
 };
+
+inline void softmax(float* x, int size) {
+    // find max value (for numerical stability)
+    float max_val = x[0];
+    for (int i = 1; i < size; i++) {
+        if (x[i] > max_val) {
+            max_val = x[i];
+        }
+    }
+    // exp and sum
+    float sum = 0.0f;
+    for (int i = 0; i < size; i++) {
+        x[i] = expf(x[i] - max_val);
+        sum += x[i];
+    }
+    // normalize
+    for (int i = 0; i < size; i++) {
+        x[i] /= sum;
+    }
+};
+
+inline void matmul_ref(float* xout, float* x, float* w, int n, int d) {
+    // W (d,n) @ x (n,) -> xout (d,)
+    // by far the most amount of time is spent inside this little function
+    int i;
+    // #pragma omp parallel for private(i)
+    for (i = 0; i < d; i++) {
+        float val = 0.0f;
+        for (int j = 0; j < n; j++) {
+            val += w[i * n + j] * x[j];
+        }
+        xout[i] = val;
+    }
+};
+
+// colmun-major order, lda = row_a, ldb = row_b, ldc = row_c
+// a(i, j) ==> a[(j) * lda + (i)]
+// b(i, j) ==> b[(j) * ldb + (i)]
+// c(i, j) ==> c[(j) * ldc + (i)]
+
+// row-major order
+// a(i, j) ==> a[(i) * lda + (j)]
+// b(i, j) ==> b[(i) * lda + (j)]
+// c(i, j) ==> c[(i) * lda + (j)]
+
+template <typename T>
+T* malloc_aligned(int m, int n, int size) {
+    std::size_t bytes = m * n * size;
+    if (bytes % MEMORY_ALIGNMENT != 0) {
+        bytes += MEMORY_ALIGNMENT - (bytes % MEMORY_ALIGNMENT);
+    }
+
+    void *ptr = std::aligned_alloc(MEMORY_ALIGNMENT, bytes);
+    if (!ptr) {
+        throw std::bad_alloc();
+    }
+    std::memset(ptr, 0, m * n * size);
+
+    return static_cast<T*>(ptr);
+}
+
+
+template <int MR = 4, int NR = 1>
+inline void AddDot_4x1(int k, float *a, float *b, float *c, int ldc) {
+    float c_00_reg, c_10_reg, c_20_reg, c_30_reg;
+    c_00_reg = 0.0;
+    c_10_reg = 0.0;
+    c_20_reg = 0.0;
+    c_30_reg = 0.0;
+
+    int p;
+    for (p = 0; p < k; ++p) {
+        float a_0p_reg = a[0 * k + p];
+        float a_1p_reg = a[1 * k + p];
+        float a_2p_reg = a[2 * k + p];
+        float a_3p_reg = a[3 * k + p];
+        float b_p0_reg = b[p * NR + 0];
+
+        // C_ij += A_ip * B_pj
+        c_00_reg += a_0p_reg * b_p0_reg;
+        c_10_reg += a_1p_reg * b_p0_reg;
+        c_20_reg += a_2p_reg * b_p0_reg;
+        c_30_reg += a_3p_reg * b_p0_reg;
+    }
+
+    c[0 * ldc + 0] += c_00_reg;
+    c[1 * ldc + 0] += c_10_reg;
+    c[2 * ldc + 0] += c_20_reg;
+    c[3 * ldc + 0] += c_30_reg;
+}
+
+
+template <int MR = 4, int NR = 1, int MC = 72, int KC = 256, int NC = 1020>
+void PackMatrixA(int m, int k, float *A, int lda, int offset, float *packA) {
+    int i, p;
+    float *src[MR];
+
+    for (i = 0; i < MR; ++i) {
+        if (i < m) {
+            src[i] = &A[(offset + i) * lda];
+        }
+        else {
+            src[i] = &A[offset * lda];
+        }
+    }
+
+    // colnum-major order packing for (i = 0; i < MR; ++i)
+    for (i = 0; i < MR; ++i) {
+        for (p = 0; p < k; ++p) {
+            *packA = src[i][p];
+            packA++;
+        }
+    }
+}
+
+template <int MR = 4, int NR = 1, int MC = 72, int KC = 256, int NC = 1020>
+void PackMatrixB(int k, int n, float *B, int ldb, int offset, float *packB) {
+    std::memcpy(packB, B + offset, NR * k * sizeof(float));
+}
+
+// MR, NR: register level block size
+// MC, NC, KC: cache level block size
+template <int MR = 4, int NR = 1, int MC = 72, int KC = 256, int NC = 1020>
+inline void gemm(int m, int n, int k, float *A, int lda, float *B, int ldb, float *C, int ldc) {
+    // int i, j, p;
+    int ic, jc, pc;
+    int min_m, min_k, min_n;
+
+    float *packA, *packB;
+    packA = malloc_aligned<float>(KC, MC + 1, sizeof(float));
+    packB = malloc_aligned<float>(KC, NC + 1, sizeof(float));
+
+    // iterate row of A
+    for (ic = 0; ic < m; ic += MC) {
+        min_m = std::min(m - ic, MC);
+
+        // col of A, row of B
+        for (pc = 0; pc < k; pc += KC) {
+            min_k = std::min(k - pc, KC);
+
+            // n = 1, so do not need third loop of n
+            // pack matrix A
+            for (int i = 0; i < min_m; i += MR) {
+                PackMatrixA<MR, NR, MC, KC, NC>(
+                    std::min(min_m - i, MR), 
+                    min_k, 
+                    &A[(ic + i) * lda + pc], 
+                    lda, 
+                    0, 
+                    &packA[i * min_k]
+                );
+            }
+
+            // pack B
+            min_n = n;
+            PackMatrixB(min_k, min_n, &B[pc], ldb, 0, packB);
+
+            // micro kernel
+            for (int i = 0; i < min_m; i += MR) {
+                AddDot_4x1<MR, NR>(
+                    min_k,
+                    &packA[i * min_k],         // A block
+                    packB,                     // B block (n=1)
+                    &C[(ic + i) * ldc],        // C block
+                    ldc
+                );
+            }
+        }
+    }
+    free(packA);
+    free(packB);
+}
+
+// W (d,n) @ x (n,1) -> xout (d,)
+// w: d x n, row-major
+// x: n x 1, row-major
+// xout: d x 1, row-major
+template <int MR = 4, int NR = 1, int MC = 72, int KC = 256, int NC = 1020>
+inline void matmul(float* xout, float* x, float* w, int n, int d) {
+    int m = d;
+    int k = n;
+    int nn = 1;
+    int lda = k;
+    int ldb = nn;
+    int ldc = nn;
+    float *C = malloc_aligned<float>(m, nn, sizeof(float));
+    gemm<MR, NR, MC, KC, NC>(m, nn, k, w, lda, x, ldb, C, ldc);
+    std::memcpy(xout, C, m * nn * sizeof(float));
+    free(C);
+}
+
+
+
+
 
 
 #endif // GEMM_HPP_
