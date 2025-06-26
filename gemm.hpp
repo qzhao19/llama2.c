@@ -10,44 +10,22 @@
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 
-#if defined(USE_SSE) || defined(USE_AVX)
-// --------------- if both defined ---------------
-#if defined(USE_SSE) && defined(USE_AVX)
-    #error "USE_SSE and USE_AVX cannot be defined simultaneously"
-#endif
-
-// --------------- compiler flag check ---------------
-#if defined(USE_SSE) && !defined(__SSE4_2__)
-    #error "USE_SSE defined but SSE4.2 not enabled. Compile with -msse4.2"
-#endif
-
-#if defined(USE_AVX) && !defined(__AVX2__)
-    #error "USE_AVX defined but AVX2 not enabled. Compile with -mavx2"
-#endif
-#endif
-
-
-#if defined(USE_SSE)
+#if defined(__SSE__)
 #include <smmintrin.h>
 #endif
 
-#if defined(USE_AVX)
+#if defined(__AVX2__)
 #include <immintrin.h> 
 #endif
 
-// tell compiler do not inline function
-#define NOINLINE __attribute__((__noinline__))
-
-#define VECTOR_REGISTERS 16
-
 // 
-#if defined(USE_SSE)
+#if defined(__SSE__)
 inline __m128 add(__m128 x, __m128 y) { return _mm_add_ps(x, y); }
 inline __m128 sub(__m128 x, __m128 y) { return _mm_sub_ps(x, y); }
 inline __m128 mul(__m128 x, __m128 y) { return _mm_mul_ps(x, y); }
 #endif  // __SSE4_2__
 
-#if defined(USE_AVX)
+#if defined(__AVX2__)
 inline __m256 add(__m256 x, __m256 y) { return _mm256_add_ps(x, y); }
 inline __m256 sub(__m256 x, __m256 y) { return _mm256_sub_ps(x, y); }
 inline __m256 mul(__m256 x, __m256 y) { return _mm256_mul_ps(x, y); }
@@ -57,72 +35,88 @@ inline __m256 mul(__m256 x, __m256 y) { return _mm256_mul_ps(x, y); }
  * Computes a * b + c.
  * apply _mm256_fmadd_ps if enable fma
  */
+template<typename T>
+inline T madd(T a, T b, T c) {
+    return add(mul(a, b), c);
+}
 
-#if defined(USE_SSE) || defined(USE_AVX)
+#if defined(__SSE__) || defined(__AVX2__)
 #if defined(__FMA__)
 template<>
 inline __m256 madd(__m256 a, __m256 b, __m256 c) {
     return _mm256_fmadd_ps(a, b, c);
 }
-#else
-template<typename T>
-inline T madd(T a, T b, T c) {
-    return add(mul(a, b), c);
-}
 #endif
 #endif
 
-//
-#if defined(USE_SSE) || defined(USE_AVX)
+#if defined(__SSE__)
 inline float hsum(__m128 x) {
-#if defined(USE_AVX)
-    x = _mm_add_ps(x, _mm_movehl_ps(x, x));
-    x = _mm_add_ss(x, _mm_movehdup_ps(x));
-#else
-    __m128 t;
-    t = _mm_shuffle_ps(x, x, _MM_SHUFFLE(2, 3, 0, 1));
+    __m128 t = _mm_shuffle_ps(x, x, _MM_SHUFFLE(2, 3, 0, 1));
     x = _mm_add_ps(x, t);
     t = _mm_movehl_ps(t, x);
     x = _mm_add_ss(x, t);
-#endif
     return _mm_cvtss_f32(x);
 }
 #endif
 
-// 
-#if defined(USE_AVX)
+#if defined(__AVX2__)
 inline float hsum(__m256 x) {
-    return hsum(_mm_add_ps(_mm256_extractf128_ps(x, 1),
-                           _mm256_castps256_ps128(x)));
+    // split 256 bit vector into 128 bit, then use below hsum(__m128)
+    __m128 hi = _mm256_extractf128_ps(x, 1);
+    __m128 lo = _mm256_castps256_ps128(x);
+    return hsum(_mm_add_ps(hi, lo));
 }
-#endif // __AVX__
+#endif
 
-template <typename T, typename U> T load(const U *);
+// declaration of basic template function load
+template <typename T> 
+T load(const float *);
 
-#if defined(USE_SSE) || defined(USE_AVX)
+#if defined(__SSE__)
 template <> 
-inline __m128 load(const float *p) {
+inline __m128 load<__m128>(const float *p) {
     return _mm_loadu_ps(p);
 }
 #endif  // __SSE__
 
-#if defined(USE_AVX)
+#if defined(__AVX2__)
 template <> 
-inline __m256 load(const float *p) {
+inline __m256 load<__m256>(const float *p) {
     return _mm256_loadu_ps(p);
 }
 #endif // __AVX__
 
-// 添加set1函数定义
-#if defined(USE_SSE)
-inline __m128 set1(float x) { return _mm_set1_ps(x); }
+// declaration of basic template function setzeros
+template <typename T>
+inline T setzeros();
+
+#if defined(__SSE__)
+template <>
+inline __m128 setzeros<__m128>() { return _mm_setzero_ps(); }
 #endif
 
-#if defined(USE_AVX)
-inline __m256 set1(float x) { return _mm256_set1_ps(x); }
+#if defined(__AVX2__)
+template <>
+inline __m256 setzeros<__m256>() { return _mm256_setzero_ps(); }
+#endif
+
+// declaration set1 basic template function
+template <typename T>
+inline T set1(float x);
+
+#if defined(__SSE__)
+template <>
+inline __m128 set1<__m128>(float x) { return _mm_set1_ps(x); }
+#endif
+
+#if defined(__AVX2__)
+template <>
+inline __m256 set1<__m256>(float x) { return _mm256_set1_ps(x); }
 #endif
 
 #define MEMORY_ALIGNMENT 32
+#define UNROLLING_SIZE 16
+
 
 inline void rmsnorm(float* o, float* x, float* weight, int size) {
     // calculate sum of squares
@@ -165,7 +159,7 @@ inline void matmul_ref(float* xout, float* x, float* w, int n, int d) {
     // W (d,n) @ x (n,) -> xout (d,)
     // by far the most amount of time is spent inside this little function
     int i;
-    // #pragma omp parallel for private(i)
+    #pragma omp parallel for private(i)
     for (i = 0; i < d; i++) {
         float val = 0.0f;
         for (int j = 0; j < n; j++) {
@@ -175,10 +169,6 @@ inline void matmul_ref(float* xout, float* x, float* w, int n, int d) {
     }
 };
 
-// colmun-major order, lda = row_a, ldb = row_b, ldc = row_c
-// a(i, j) ==> a[(j) * lda + (i)]
-// b(i, j) ==> b[(j) * ldb + (i)]
-// c(i, j) ==> c[(j) * ldc + (i)]
 
 // row-major order
 // a(i, j) ==> a[(i) * lda + (j)]
@@ -201,36 +191,133 @@ T* malloc_aligned(int m, int n, int size) {
     return static_cast<T*>(ptr);
 }
 
-
 template <int MR = 4, int NR = 1>
 inline void AddDot_4x1(int k, float *a, float *b, float *c, int ldc) {
-    float c_00_reg, c_10_reg, c_20_reg, c_30_reg;
-    c_00_reg = 0.0;
-    c_10_reg = 0.0;
-    c_20_reg = 0.0;
-    c_30_reg = 0.0;
+    float c_00, c_10, c_20, c_30;
+    c_00 = 0.0;
+    c_10 = 0.0;
+    c_20 = 0.0;
+    c_30 = 0.0;
 
-    int p;
-    for (p = 0; p < k; ++p) {
-        float a_0p_reg = a[0 * k + p];
-        float a_1p_reg = a[1 * k + p];
-        float a_2p_reg = a[2 * k + p];
-        float a_3p_reg = a[3 * k + p];
-        float b_p0_reg = b[p * NR + 0];
+    // declare register vars for result matrix a
+    __m256 c_00_ymm0 = setzeros<__m256>(); __m256 c_00_ymm1 = setzeros<__m256>();
+    __m256 c_10_ymm0 = setzeros<__m256>(); __m256 c_10_ymm1 = setzeros<__m256>();
+    __m256 c_20_ymm0 = setzeros<__m256>(); __m256 c_20_ymm1 = setzeros<__m256>();
+    __m256 c_30_ymm0 = setzeros<__m256>(); __m256 c_30_ymm1 = setzeros<__m256>();
 
-        // C_ij += A_ip * B_pj
-        c_00_reg += a_0p_reg * b_p0_reg;
-        c_10_reg += a_1p_reg * b_p0_reg;
-        c_20_reg += a_2p_reg * b_p0_reg;
-        c_30_reg += a_3p_reg * b_p0_reg;
+    // declare register vars for matrix a and vector b
+    __m256 a_0p_ymm0 = setzeros<__m256>(); __m256 a_0p_ymm1 = setzeros<__m256>();
+    __m256 a_1p_ymm0 = setzeros<__m256>(); __m256 a_1p_ymm1 = setzeros<__m256>();
+    __m256 a_2p_ymm0 = setzeros<__m256>(); __m256 a_2p_ymm1 = setzeros<__m256>();
+    __m256 a_3p_ymm0 = setzeros<__m256>(); __m256 a_3p_ymm1 = setzeros<__m256>();
+    __m256 b_p0_ymm0 = setzeros<__m256>(); __m256 b_p0_ymm1 = setzeros<__m256>();
+
+    // define pointers to a and b
+    float *a_0p_ptr = a + 0 * k;
+    float *a_1p_ptr = a + 1 * k;
+    float *a_2p_ptr = a + 2 * k;
+    float *a_3p_ptr = a + 3 * k;
+    float *b_p0_ptr = b;
+
+    int p = 0;
+    const int aligned_end = k & ~(UNROLLING_SIZE - 1);
+
+    for (; p < aligned_end; p += UNROLLING_SIZE) {
+        // pre-fetch data
+        _mm_prefetch(reinterpret_cast<const char*>(a_0p_ptr + p + 16), _MM_HINT_T0);
+        _mm_prefetch(reinterpret_cast<const char*>(a_1p_ptr + p + 16), _MM_HINT_T0);
+        _mm_prefetch(reinterpret_cast<const char*>(a_2p_ptr + p + 16), _MM_HINT_T0);
+        _mm_prefetch(reinterpret_cast<const char*>(a_3p_ptr + p + 16), _MM_HINT_T0);
+        _mm_prefetch(reinterpret_cast<const char*>(b_p0_ptr + p + 16), _MM_HINT_T0);
+
+        // load vector b 
+        b_p0_ymm0 = load<__m256>(b_p0_ptr + p + 0); 
+        b_p0_ymm1 = load<__m256>(b_p0_ptr + p + 8);
+
+        // load matrix a_0p and compute c00 = a_0p * b_p0
+        a_0p_ymm0 = load<__m256>(a_0p_ptr + p + 0); 
+        a_0p_ymm1 = load<__m256>(a_0p_ptr + p + 8);
+        c_00_ymm0 = madd(a_0p_ymm0, b_p0_ymm0, c_00_ymm0);
+        c_00_ymm1 = madd(a_0p_ymm1, b_p0_ymm1, c_00_ymm1);
+
+        // load matrix a_1p and compute c10 = a_1p * b_p0
+        a_1p_ymm0 = load<__m256>(a_1p_ptr + p + 0); 
+        a_1p_ymm1 = load<__m256>(a_1p_ptr + p + 8);
+        c_10_ymm0 = madd(a_1p_ymm0, b_p0_ymm0, c_10_ymm0); 
+        c_10_ymm1 = madd(a_1p_ymm1, b_p0_ymm1, c_10_ymm1);
+
+        // load matrix a_2p and compute c20 = a_2p * b_p0
+        a_2p_ymm0 = load<__m256>(a_2p_ptr + p + 0); 
+        a_2p_ymm1 = load<__m256>(a_2p_ptr + p + 8);
+        c_20_ymm0 = madd(a_2p_ymm0, b_p0_ymm0, c_20_ymm0); 
+        c_20_ymm1 = madd(a_2p_ymm1, b_p0_ymm1, c_20_ymm1);
+
+        // load matrix a_3p and compute c30 = a_3p * b_p0
+        a_3p_ymm0 = load<__m256>(a_3p_ptr + p + 0); 
+        a_3p_ymm1 = load<__m256>(a_3p_ptr + p + 8);
+        c_30_ymm0 = madd(a_3p_ymm0, b_p0_ymm0, c_30_ymm0); 
+        c_30_ymm1 = madd(a_3p_ymm1, b_p0_ymm1, c_30_ymm1);
     }
 
-    c[0 * ldc + 0] += c_00_reg;
-    c[1 * ldc + 0] += c_10_reg;
-    c[2 * ldc + 0] += c_20_reg;
-    c[3 * ldc + 0] += c_30_reg;
+    c_00 += hsum(add(c_00_ymm0, c_00_ymm1));
+    c_10 += hsum(add(c_10_ymm0, c_10_ymm1)); 
+    c_20 += hsum(add(c_20_ymm0, c_20_ymm1));
+    c_30 += hsum(add(c_30_ymm0, c_30_ymm1));
+
+    const int remainder = k - aligned_end;
+    if (remainder > 0) {
+        // load matrix a
+        __m128 a_0p_xmm = setzeros<__m128>();
+        __m128 a_1p_xmm = setzeros<__m128>();
+        __m128 a_2p_xmm = setzeros<__m128>();
+        __m128 a_3p_xmm = setzeros<__m128>();
+        // load vector b
+        __m128 b_p0_xmm = setzeros<__m128>(); 
+        // load result matrix c
+        __m128 c_00_xmm = setzeros<__m128>();
+        __m128 c_10_xmm = setzeros<__m128>();
+        __m128 c_20_xmm = setzeros<__m128>();
+        __m128 c_30_xmm = setzeros<__m128>();
+
+        int r = 0;
+        for (; r + 3 < remainder; r += 4) {
+            b_p0_xmm = _mm_loadu_ps(b_p0_ptr + p + r);
+            // c_00_xmm = 
+            a_0p_xmm = load<__m128>(a_0p_ptr + p + r);
+            a_1p_xmm = load<__m128>(a_1p_ptr + p + r);
+            a_2p_xmm = load<__m128>(a_2p_ptr + p + r);
+            a_3p_xmm = load<__m128>(a_3p_ptr + p + r);
+
+            // compute c += a * b
+            c_00_xmm = add(c_00_xmm, mul(a_0p_xmm, b_p0_xmm));
+            c_10_xmm = add(c_10_xmm, mul(a_1p_xmm, b_p0_xmm));
+            c_20_xmm = add(c_20_xmm, mul(a_2p_xmm, b_p0_xmm));
+            c_30_xmm = add(c_30_xmm, mul(a_3p_xmm, b_p0_xmm));
+        }
+
+        c_00 += hsum(c_00_xmm);
+        c_10 += hsum(c_10_xmm);
+        c_20 += hsum(c_20_xmm);
+        c_30 += hsum(c_30_xmm);
+
+        // the last elements which are less than 4
+        for (; r < remainder; ++r) {
+            float b_p0 = b_p0_ptr[p + r];
+            c_00 += a_0p_ptr[p + r] * b_p0;
+            c_10 += a_1p_ptr[p + r] * b_p0;
+            c_20 += a_2p_ptr[p + r] * b_p0;
+            c_30 += a_3p_ptr[p + r] * b_p0;
+        }   
+    }
+
+    c[0 * ldc + 0] += c_00;
+    c[1 * ldc + 0] += c_10;
+    c[2 * ldc + 0] += c_20;
+    c[3 * ldc + 0] += c_30;
 }
 
+template <std::int64_t MR, std::int64_t NR>
+using MicroKernelType = void (*)(std::int64_t, float*, float*, float*, std::int64_t);
 
 template <int MR = 4, int NR = 1, int MC = 72, int KC = 256, int NC = 1020>
 void PackMatrixA(int m, int k, float *A, int lda, int offset, float *packA) {
@@ -317,7 +404,7 @@ inline void gemm(int m, int n, int k, float *A, int lda, float *B, int ldb, floa
 // w: d x n, row-major
 // x: n x 1, row-major
 // xout: d x 1, row-major
-template <int MR = 4, int NR = 1, int MC = 72, int KC = 256, int NC = 1020>
+template <int MR = 4, int NR = 1, int MC = 72, int KC = 512, int NC = 1020>
 inline void matmul(float* xout, float* x, float* w, int n, int d) {
     int m = d;
     int k = n;
@@ -330,10 +417,6 @@ inline void matmul(float* xout, float* x, float* w, int n, int d) {
     std::memcpy(xout, C, m * nn * sizeof(float));
     free(C);
 }
-
-
-
-
 
 
 #endif // GEMM_HPP_
