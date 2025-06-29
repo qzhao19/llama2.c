@@ -3,6 +3,7 @@
 
 #include <cmath>
 #include <cstring>
+#include <new>
 
 #undef MIN
 #undef MAX
@@ -118,42 +119,7 @@ inline __m256 set1<__m256>(float x) { return _mm256_set1_ps(x); }
 #define UNROLLING_SIZE 16
 
 
-inline void rmsnorm(float* o, float* x, float* weight, int size) {
-    // calculate sum of squares
-    // variance 
-    float ss = 0.0f;
-    for (int j = 0; j < size; j++) {
-        ss += x[j] * x[j];
-    }
-    ss /= size;
-    // 1 / sqrt(variance + epsilon)
-    ss += 1e-5f;
-    ss = 1.0f / sqrtf(ss);
-    // normalize and scale
-    for (int j = 0; j < size; j++) {
-        o[j] = weight[j] * (ss * x[j]);
-    }
-};
 
-inline void softmax(float* x, int size) {
-    // find max value (for numerical stability)
-    float max_val = x[0];
-    for (int i = 1; i < size; i++) {
-        if (x[i] > max_val) {
-            max_val = x[i];
-        }
-    }
-    // exp and sum
-    float sum = 0.0f;
-    for (int i = 0; i < size; i++) {
-        x[i] = expf(x[i] - max_val);
-        sum += x[i];
-    }
-    // normalize
-    for (int i = 0; i < size; i++) {
-        x[i] /= sum;
-    }
-};
 
 inline void matmul_ref(float* xout, float* x, float* w, int n, int d) {
     // W (d,n) @ x (n,) -> xout (d,)
@@ -168,7 +134,6 @@ inline void matmul_ref(float* xout, float* x, float* w, int n, int d) {
         xout[i] = val;
     }
 };
-
 
 // row-major order
 // a(i, j) ==> a[(i) * lda + (j)]
@@ -316,9 +281,6 @@ inline void AddDot_4x1(int k, float *a, float *b, float *c, int ldc) {
     c[3 * ldc + 0] += c_30;
 }
 
-template <std::int64_t MR, std::int64_t NR>
-using MicroKernelType = void (*)(std::int64_t, float*, float*, float*, std::int64_t);
-
 template <int MR = 4, int NR = 1, int MC = 72, int KC = 256, int NC = 1020>
 void PackMatrixA(int m, int k, float *A, int lda, int offset, float *packA) {
     int i, p;
@@ -404,7 +366,6 @@ inline void gemm(int m, int n, int k, float *A, int lda, float *B, int ldb, floa
 // w: d x n, row-major
 // x: n x 1, row-major
 // xout: d x 1, row-major
-template <int MR = 4, int NR = 1, int MC = 72, int KC = 512, int NC = 1020>
 inline void matmul(float* xout, float* x, float* w, int n, int d) {
     int m = d;
     int k = n;
@@ -412,6 +373,7 @@ inline void matmul(float* xout, float* x, float* w, int n, int d) {
     int lda = k;
     int ldb = nn;
     int ldc = nn;
+    constexpr int MR = 4, NR = 1, MC = 72, KC = 256, NC = 1020;
     float *C = malloc_aligned<float>(m, nn, sizeof(float));
     gemm<MR, NR, MC, KC, NC>(m, nn, k, w, lda, x, ldb, C, ldc);
     std::memcpy(xout, C, m * nn * sizeof(float));
