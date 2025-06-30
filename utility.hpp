@@ -23,9 +23,6 @@
     #include <sys/mman.h>
 #endif
 
-// Global var group size for quantization of the weights
-extern int GS;
-
 // ----------------------------------------------------------------------------
 // Utility function
 
@@ -94,6 +91,18 @@ inline void softmax(float* x, int size) {
 };
 
 // ----------------------------------------------------------------------------
+// forward definition
+struct Config;
+struct TokenIndex;
+struct TokenizerData;
+struct ProbaIndex;
+
+using ConfigType = Config;
+using TokenIndexType = TokenIndex;
+using TokenizerDataType = TokenizerData;
+using ProbaIndexType = ProbaIndex;
+
+// ----------------------------------------------------------------------------
 // struct definitions
 
 // store params of transformer model 
@@ -106,7 +115,6 @@ struct Config {
     int vocab_size; // vocabulary size, usually 256 (byte-level)
     int seq_len; // max sequence length
 };
-using ConfigType = Config;
 
 // ----------------------------------------------------------------------------
 // Tokennizer
@@ -119,17 +127,6 @@ struct TokenIndex {
         return str < other.str;
     }
 };
-using TokenIndexType = TokenIndex;
-
-struct TokenizerData {
-    std::vector<std::unique_ptr<char[]>> vocab;
-    std::vector<TokenIndexType> sorted_vocab;
-    std::vector<float> vocab_scores;
-    int vocab_size;
-    unsigned int max_token_length;
-    unsigned char byte_pieces[512]; // stores all single-byte strings
-};
-using TokenizerDataType = TokenizerData;
 
 inline int string_lookup(const std::string& str, 
                          const int vocab_size,
@@ -152,6 +149,15 @@ inline int string_lookup(const std::string& str,
     );
     return matched_string != nullptr ? matched_string->id : -1;
 }
+
+struct TokenizerData {
+    std::vector<std::unique_ptr<char[]>> vocab;
+    std::vector<TokenIndexType> sorted_vocab;
+    std::vector<float> vocab_scores;
+    int vocab_size;
+    unsigned int max_token_length;
+    unsigned char byte_pieces[512]; // stores all single-byte strings
+};
 
 class Tokenizer {
 private:
@@ -178,7 +184,6 @@ struct ProbaIndex {
     float proba;
     int index;
 };
-using ProbaIndexType = ProbaIndex;
 
 class Sampler {
 private:
