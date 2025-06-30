@@ -4,6 +4,17 @@
 #include "utility.hpp"
 
 // ----------------------------------------------------------------------------
+// forward definition
+
+struct RunState;
+struct TransformerWeights;
+struct TransformerModel;
+
+using RunStateType = RunState;
+using TransformerWeightsType = TransformerWeights;
+using TransformerModelType = TransformerModel;
+
+// ----------------------------------------------------------------------------
 // struct definitions
 
 // all weights params of model
@@ -51,16 +62,12 @@ struct RunState {
     std::vector<float> value_cache; // (layer, seq_len, dim)
 };
 
-using RunStateType = RunState;
-using TransformerWeightsType = TransformerWeights;
-
 // transformer model
 struct TransformerModel {
     std::unique_ptr<ConfigType> config;
     std::unique_ptr<RunStateType> state;
     std::unique_ptr<TransformerWeightsType> weight;
 };
-using TransformerModelType = TransformerModel;
 
 // ----------------------------------------------------------------------------
 // Transformer model
