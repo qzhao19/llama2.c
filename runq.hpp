@@ -3,8 +3,22 @@
 
 #include "utility.hpp"
 
+// Global var group size for quantization of the weights
+extern int GS;
+
+// forward definition
+struct QuantizedTensor;
+struct RunState;
+struct TransformerWeights;
+struct TransformerModel;
+
+using QuantizedTensorType = QuantizedTensor;
+using RunStateType = RunState;
+using TransformerWeightsType = TransformerWeights;
+using TransformerModelType = TransformerModel;
+
 // Quantization functions
-inline void quantize(QuantizedTensor *qx, float* x, int n) {
+inline void quantize(QuantizedTensorType *xq, float* x, int n) {
     int num_groups = n / GS;
     float Q_MAX = 127.0f;
 
@@ -21,29 +35,57 @@ inline void quantize(QuantizedTensor *qx, float* x, int n) {
 
         // calculate and write the scaling factor
         float scale = wmax / Q_MAX;
-        qx->s[group] = scale;
+        xq->s[group] = scale;
 
         // calculate and write the quantized values
         for (int i = 0; i < GS; i++) {
             float quant_value = x[group * GS + i] / scale; // scale
             int8_t quantized = static_cast<int8_t>(round(quant_value)); // round and clamp
-            qx->q[group * GS + i] = quantized;
+            xq->q[group * GS + i] = quantized;
         }
     }
 }
 
-inline void dequantize(const std::vector<QuantizedTensor> &qx, std::vector<float> &x, int n) {
+void dequantize(QuantizedTensorType *qx, float* x, int n) {
     for (int i = 0; i < n; i++) {
         x[i] = qx->q[i] * qx->s[i / GS];
     }
 }
 
-inline void init_quantized_tensors(std::ifstream& file, std::vector<QuantizedTensor>& w, int n_layers, int layer_size) {
+/* initialize `n` x quantized tensor (with `size_each` elements), starting from memory pointed at *ptr */
+inline void init_quantized_tensors(std::ifstream &file, QuantizedTensorType *w, int n_layers, int size_each) {
     for(int i = 0; i < n_layers; i++) {
-        w[i].q.resize(layer_size);
-        w[i].s.resize(layer_size / GS);
-        file.read(reinterpret_cast<char*>(w[i].q.data()), layer_size * sizeof(int8_t));
-        file.read(reinterpret_cast<char*>(w[i].s.data()), layer_size / GS * sizeof(float));
+        w[i].q.resize(size_each);
+        w[i].s.resize(size_each / GS);
+        file.read(reinterpret_cast<char*>(w[i].q.data()), size_each * sizeof(int8_t));
+        file.read(reinterpret_cast<char*>(w[i].s.data()), size_each / GS * sizeof(float));
+    }
+}
+
+inline void matmul(float* xout, QuantizedTensorType *x, QuantizedTensorType *w, int n, int d) {
+    // W (d,n) @ x (n,) -> xout (d,)
+    // by far the most amount of time is spent inside this little function
+    // inputs to this function are both quantized
+
+    int i;
+    #pragma omp parallel for private(i)
+    for (i = 0; i < d; i++) {
+
+        float val = 0.0f;
+        int32_t ival = 0;
+        int in = i * n;
+
+        // do the matmul in groups of GS
+        int j;
+        for (j = 0; j <= n - GS; j += GS) {
+            for (int k = 0; k < GS; k++) {
+                ival += ((int32_t) x->q[j + k]) * ((int32_t) w->q[in + j + k]);
+            }
+            val += ((float) ival) * w->s[(in + j) / GS] * x->s[j / GS];
+            ival = 0;
+        }
+
+        xout[i] = val;
     }
 }
 
@@ -55,7 +97,6 @@ struct QuantizedTensor {
     std::vector<std::int8_t> q;   // quantized values
     std::vector<float> s;         // scaling factors
 };
-using QuantizedTensorType = QuantizedTensor;
 
 // all weights params of model
 struct TransformerWeights {
@@ -66,7 +107,6 @@ struct TransformerWeights {
     // rmsnorms layer
     std::vector<float> rms_att_weight; // (layer, dim) rmsnorm weights
     std::vector<float> rms_ffn_weight; // (layer, dim)
-    // final rmsnorm
     std::vector<float> rms_final_weight; // (dim,) for the last layer
 
     // attention block
@@ -93,8 +133,10 @@ struct RunState {
     std::vector<float> xb2; // an additional buffer just for convenience (dim,)
     std::vector<float> hb; // buffer for hidden dimension in the ffn (hidden_dim,)
     std::vector<float> hb2; // buffer for hidden dimension in the ffn (hidden_dim,)
+    
     std::vector<QuantizedTensorType> xq; // quantized x (dim,)
     std::vector<QuantizedTensorType> hq; // quantized hb (hidden_dim,)
+    
     std::vector<float> q; // query (dim,)
     float *k;
     float *v;
@@ -105,16 +147,12 @@ struct RunState {
     std::vector<float> value_cache; // (layer, seq_len, kv_dim)
 };
 
-using RunStateType = RunState;
-using TransformerWeightsType = TransformerWeights;
-
 // transformer model
 struct TransformerModel {
     std::unique_ptr<ConfigType> config;
     std::unique_ptr<RunStateType> state;
     std::unique_ptr<TransformerWeightsType> weight;
 };
-using TransformerModelType = TransformerModel;
 
 class Transformer {
 private:
@@ -143,11 +181,8 @@ public:
     ~Transformer() = default;
     
     void load_model(std::string_view ckpt_path);
-    
     std::vector<float> forward(int token, int pos);
-
     int get_vocab_size() const { return model_->config->vocab_size; }
-
     int get_seq_len() const { return model_->config->seq_len; }
 };
 
