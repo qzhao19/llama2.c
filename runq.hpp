@@ -7,15 +7,22 @@
 extern int GS;
 
 // forward definition
-struct QuantizedTensor;
+// struct QuantizedTensor;
 struct RunState;
 struct TransformerWeights;
 struct TransformerModel;
 
-using QuantizedTensorType = QuantizedTensor;
 using RunStateType = RunState;
 using TransformerWeightsType = TransformerWeights;
 using TransformerModelType = TransformerModel;
+
+// define struct QuantizedTensor
+struct QuantizedTensor {
+    std::vector<std::int8_t> q;   // quantized values
+    std::vector<float> s;         // scaling factors
+};
+using QuantizedTensorType = QuantizedTensor;
+
 
 // Quantization functions
 inline void quantize(QuantizedTensorType *xq, float* x, int n) {
@@ -46,7 +53,7 @@ inline void quantize(QuantizedTensorType *xq, float* x, int n) {
     }
 }
 
-void dequantize(QuantizedTensorType *qx, float* x, int n) {
+inline void dequantize(QuantizedTensorType *qx, float* x, int n) {
     for (int i = 0; i < n; i++) {
         x[i] = qx->q[i] * qx->s[i / GS];
     }
@@ -92,11 +99,7 @@ inline void matmul(float* xout, QuantizedTensorType *x, QuantizedTensorType *w, 
 // ----------------------------------------------------------------------------
 // struct definitions
 
-// 
-struct QuantizedTensor {
-    std::vector<std::int8_t> q;   // quantized values
-    std::vector<float> s;         // scaling factors
-};
+
 
 // all weights params of model
 struct TransformerWeights {
@@ -184,6 +187,8 @@ public:
     std::vector<float> forward(int token, int pos);
     int get_vocab_size() const { return model_->config->vocab_size; }
     int get_seq_len() const { return model_->config->seq_len; }
+
+    void print_model_info();
 };
 
 
