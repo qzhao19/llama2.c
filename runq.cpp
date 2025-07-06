@@ -68,12 +68,6 @@ void Transformer::malloc_weights() {
     // weight_->q_tokens = new QuantizedTensorType();
     weight_->q_tokens.resize(1);
     weight_->wcls.resize(1);
-    // if (!shared_weights_) {
-    //     weight_->wcls.resize(config_->vocab_size * config_->dim);
-    //     if (weight_->wcls.empty()) {
-    //         throw std::runtime_error("Malloc for wcls weights failed.");
-    //     }
-    // }
     
     if (weight_->token_embedding_table.empty() || weight_->rms_att_weight.empty() || 
         weight_->rms_ffn_weight.empty() || weight_->rms_final_weight.empty() || 
@@ -155,8 +149,6 @@ void Transformer::load_model(std::string_view ckpt_path) {
         weight_->wcls = weight_->q_tokens;
     }
 
-
-
     file.close();
     malloc_run_state();
     // 
@@ -190,13 +182,13 @@ std::vector<float> Transformer::forward(int token, int pos) {
         // qkv matmuls for this position
         quantize(model_->state->xq.data(), model_->state->xb.data(), dim);
         matmul(model_->state->q.data(), model_->state->xq.data(), &model_->weight->wq[l], dim, dim);
-        matmul(model_->state->k, model_->state->xq.data(), &model_->weight->wq[l], dim, dim);
-        matmul(model_->state->v, model_->state->xq.data(), &model_->weight->wq[l], dim, dim);
+        matmul(model_->state->k, model_->state->xq.data(), &model_->weight->wk[l], dim, dim);
+        matmul(model_->state->v, model_->state->xq.data(), &model_->weight->wv[l], dim, dim);
 
         // RoPE relative positional encoding: complex-valued rotate q and k in each head
         for (int i = 0; i < dim; i+=2) {
             int head_dim = i % head_size;
-            float freq = 1.0f / powf(10000.0f, head_dim / (float)head_size);
+            float freq = 1.0f / powf(10000.0f, head_dim / static_cast<float>(head_size));
             float val = pos * freq;
             float fcr = cosf(val);
             float fci = sinf(val);
@@ -263,8 +255,8 @@ std::vector<float> Transformer::forward(int token, int pos) {
         // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
         // first calculate self.w1(x) and self.w3(x)
         quantize(model_->state->xq.data(), model_->state->xb.data(), dim);
-        matmul(model_->state->hb.data(), model_->state->xq.data(), model_->weight->w1.data(), dim, hidden_dim);
-        matmul(model_->state->hb2.data(), model_->state->xq.data(), model_->weight->w3.data(), dim, hidden_dim);
+        matmul(model_->state->hb.data(), model_->state->xq.data(), &model_->weight->w1[l], dim, hidden_dim);
+        matmul(model_->state->hb2.data(), model_->state->xq.data(), &model_->weight->w3[l], dim, hidden_dim);
 
         // SwiGLU non-linearity
         for (int i = 0; i < hidden_dim; i++) {
@@ -295,81 +287,4 @@ std::vector<float> Transformer::forward(int token, int pos) {
     return model_->state->logits;
 }
 
-void Transformer::print_model_info() {
-    if (!model_ || !model_->config || !model_->weight) {
-        std::cout << "Model configuration or weights are not initialized." << std::endl;
-        return;
-    }
-
-    const auto& config = *model_->config;
-    const auto& weights = *model_->weight;
-
-    std::cout << "Model Information:" << std::endl;
-    std::cout << "  Shared Weights: " << (shared_weights_ ? "Yes" : "No") << std::endl;
-    std::cout << "  Vocab Size: " << config.vocab_size << std::endl;
-    std::cout << "  Sequence Length: " << config.seq_len << std::endl;
-    std::cout << "  Number of Layers: " << config.n_layers << std::endl;
-    std::cout << "  Dimension: " << config.dim << std::endl;
-    std::cout << "  Hidden Dimension: " << config.hidden_dim << std::endl;
-    std::cout << "  Number of Heads: " << config.n_heads << std::endl;
-    std::cout << "  Number of KV Heads: " << config.n_kv_heads << std::endl;
-
-    std::cout << "Weights Information:" << std::endl;
-    std::cout << "  Token Embedding Table Size: " << weights.token_embedding_table.size() << std::endl;
-    if (!weights.token_embedding_table.empty()) {
-        std::cout << "  Token Embedding Table Sample: " << weights.token_embedding_table[0] << std::endl;
-    }
-    std::cout << "  RMS Attention Weight Size: " << weights.rms_att_weight.size() << std::endl;
-    if (!weights.rms_att_weight.empty()) {
-        std::cout << "  RMS Attention Weight Sample: " << weights.rms_att_weight[0] << std::endl;
-    }
-    std::cout << "  RMS FFN Weight Size: " << weights.rms_ffn_weight.size() << std::endl;
-    if (!weights.rms_ffn_weight.empty()) {
-        std::cout << "  RMS FFN Weight Sample: " << weights.rms_ffn_weight[0] << std::endl;
-    }
-    std::cout << "  RMS Final Weight Size: " << weights.rms_final_weight.size() << std::endl;
-    if (!weights.rms_final_weight.empty()) {
-        std::cout << "  RMS Final Weight Sample: " << weights.rms_final_weight[0] << std::endl;
-    }
-    std::cout << "  WQ Layers: " << weights.wq.size() << std::endl;
-    if (!weights.wq.empty() && !weights.wq[0].q.empty()) {
-        std::cout << "  WQ Sample Quantized Value: " << static_cast<int>(weights.wq[0].q[0]) << std::endl;
-        std::cout << "  WQ Sample Scaling Factor: " << weights.wq[0].s[0] << std::endl;
-    }
-    std::cout << "  WK Layers: " << weights.wk.size() << std::endl;
-    if (!weights.wk.empty() && !weights.wk[0].q.empty()) {
-        std::cout << "  WK Sample Quantized Value: " << static_cast<int>(weights.wk[0].q[0]) << std::endl;
-        std::cout << "  WK Sample Scaling Factor: " << weights.wk[0].s[0] << std::endl;
-    }
-    std::cout << "  WV Layers: " << weights.wv.size() << std::endl;
-    if (!weights.wv.empty() && !weights.wv[0].q.empty()) {
-        std::cout << "  WV Sample Quantized Value: " << static_cast<int>(weights.wv[0].q[0]) << std::endl;
-        std::cout << "  WV Sample Scaling Factor: " << weights.wv[0].s[0] << std::endl;
-    }
-    std::cout << "  WO Layers: " << weights.wo.size() << std::endl;
-    if (!weights.wo.empty() && !weights.wo[0].q.empty()) {
-        std::cout << "  WO Sample Quantized Value: " << static_cast<int>(weights.wo[0].q[0]) << std::endl;
-        std::cout << "  WO Sample Scaling Factor: " << weights.wo[0].s[0] << std::endl;
-    }
-    std::cout << "  W1 Layers: " << weights.w1.size() << std::endl;
-    if (!weights.w1.empty() && !weights.w1[0].q.empty()) {
-        std::cout << "  W1 Sample Quantized Value: " << static_cast<int>(weights.w1[0].q[0]) << std::endl;
-        std::cout << "  W1 Sample Scaling Factor: " << weights.w1[0].s[0] << std::endl;
-    }
-    std::cout << "  W2 Layers: " << weights.w2.size() << std::endl;
-    if (!weights.w2.empty() && !weights.w2[0].q.empty()) {
-        std::cout << "  W2 Sample Quantized Value: " << static_cast<int>(weights.w2[0].q[0]) << std::endl;
-        std::cout << "  W2 Sample Scaling Factor: " << weights.w2[0].s[0] << std::endl;
-    }
-    std::cout << "  W3 Layers: " << weights.w3.size() << std::endl;
-    if (!weights.w3.empty() && !weights.w3[0].q.empty()) {
-        std::cout << "  W3 Sample Quantized Value: " << static_cast<int>(weights.w3[0].q[0]) << std::endl;
-        std::cout << "  W3 Sample Scaling Factor: " << weights.w3[0].s[0] << std::endl;
-    }
-    std::cout << "  WCLS Size: " << weights.wcls.size() << std::endl;
-    if (!weights.wcls.empty() && !weights.wcls[0].q.empty()) {
-        std::cout << "  WCLS Sample Quantized Value: " << static_cast<int>(weights.wcls[0].q[0]) << std::endl;
-        std::cout << "  WCLS Sample Scaling Factor: " << weights.wcls[0].s[0] << std::endl;
-    }
-}
 
