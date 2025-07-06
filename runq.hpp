@@ -187,8 +187,6 @@ public:
     std::vector<float> forward(int token, int pos);
     int get_vocab_size() const { return model_->config->vocab_size; }
     int get_seq_len() const { return model_->config->seq_len; }
-
-    void print_model_info();
 };
 
 
