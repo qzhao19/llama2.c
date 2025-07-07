@@ -118,9 +118,6 @@ inline __m256 set1<__m256>(float x) { return _mm256_set1_ps(x); }
 #define MEMORY_ALIGNMENT 32
 #define UNROLLING_SIZE 16
 
-
-
-
 inline void matmul_ref(float* xout, float* x, float* w, int n, int d) {
     // W (d,n) @ x (n,) -> xout (d,)
     // by far the most amount of time is spent inside this little function
@@ -134,11 +131,6 @@ inline void matmul_ref(float* xout, float* x, float* w, int n, int d) {
         xout[i] = val;
     }
 };
-
-// row-major order
-// a(i, j) ==> a[(i) * lda + (j)]
-// b(i, j) ==> b[(i) * lda + (j)]
-// c(i, j) ==> c[(i) * lda + (j)]
 
 template <typename T>
 T* malloc_aligned(int m, int n, int size) {
@@ -156,9 +148,9 @@ T* malloc_aligned(int m, int n, int size) {
     return static_cast<T*>(ptr);
 }
 
-template <int MR = 4, int NR = 1>
-inline void AddDot_4x1(int k, float *a, float *b, float *c, int ldc) {
-    float c_00, c_10, c_20, c_30;
+template <typename TA, typename TB, typename TC, int MR = 4, int NR = 1>
+inline void AddDot_4x1(int k, TA *a, TB *b, TC *c, int ldc) {
+    TC c_00, c_10, c_20, c_30;
     c_00 = 0.0;
     c_10 = 0.0;
     c_20 = 0.0;
@@ -178,11 +170,11 @@ inline void AddDot_4x1(int k, float *a, float *b, float *c, int ldc) {
     __m256 b_p0_ymm0 = setzeros<__m256>(); __m256 b_p0_ymm1 = setzeros<__m256>();
 
     // define pointers to a and b
-    float *a_0p_ptr = a + 0 * k;
-    float *a_1p_ptr = a + 1 * k;
-    float *a_2p_ptr = a + 2 * k;
-    float *a_3p_ptr = a + 3 * k;
-    float *b_p0_ptr = b;
+    TA *a_0p_ptr = a + 0 * k;
+    TA *a_1p_ptr = a + 1 * k;
+    TA *a_2p_ptr = a + 2 * k;
+    TA *a_3p_ptr = a + 3 * k;
+    TB *b_p0_ptr = b;
 
     int p = 0;
     const int aligned_end = k & ~(UNROLLING_SIZE - 1);
@@ -267,7 +259,7 @@ inline void AddDot_4x1(int k, float *a, float *b, float *c, int ldc) {
 
         // the last elements which are less than 4
         for (; r < remainder; ++r) {
-            float b_p0 = b_p0_ptr[p + r];
+            TB b_p0 = b_p0_ptr[p + r];
             c_00 += a_0p_ptr[p + r] * b_p0;
             c_10 += a_1p_ptr[p + r] * b_p0;
             c_20 += a_2p_ptr[p + r] * b_p0;
@@ -281,86 +273,118 @@ inline void AddDot_4x1(int k, float *a, float *b, float *c, int ldc) {
     c[3 * ldc + 0] += c_30;
 }
 
-template <int MR = 4, int NR = 1, int MC = 72, int KC = 256, int NC = 1020>
-void PackMatrixA(int m, int k, float *A, int lda, int offset, float *packA) {
-    int i, p;
-    float *src[MR];
+template <typename TA, typename TB, typename TC, int RM, int RN>
+using MicroKernelType = void (*)(int, TA*, TB*, TC*, int);
 
-    for (i = 0; i < MR; ++i) {
-        if (i < m) {
-            src[i] = &A[(offset + i) * lda];
-        }
-        else {
-            src[i] = &A[offset * lda];
-        }
-    }
+// row-major order
+// a(i, j) ==> a[(i) * lda + (j)]
+// b(i, j) ==> b[(i) * lda + (j)]
+// c(i, j) ==> c[(i) * lda + (j)]
 
-    // colnum-major order packing for (i = 0; i < MR; ++i)
-    for (i = 0; i < MR; ++i) {
-        for (p = 0; p < k; ++p) {
-            *packA = src[i][p];
-            packA++;
-        }
-    }
-}
+template <typename TA, typename TB, typename TC, 
+          int RM = 4, int RN = 1, 
+          int CM = 72, int CK = 256, int CN = 1020>
+class GEMM {
+private:
+    const TA *const A_;
+    const TB *const B_;
+    TC *const C_;
 
-template <int MR = 4, int NR = 1, int MC = 72, int KC = 256, int NC = 1020>
-void PackMatrixB(int k, int n, float *B, int ldb, int offset, float *packB) {
-    std::memcpy(packB, B + offset, NR * k * sizeof(float));
-}
+    // const int k_;
+    const int lda_;
+    const int ldb_;
+    const int ldc_;
 
-// MR, NR: register level block size
-// MC, NC, KC: cache level block size
-template <int MR = 4, int NR = 1, int MC = 72, int KC = 256, int NC = 1020>
-inline void gemm(int m, int n, int k, float *A, int lda, float *B, int ldb, float *C, int ldc) {
-    // int i, j, p;
-    int ic, jc, pc;
-    int min_m, min_k, min_n;
+    MicroKernelType<TA, TB, TC, RM, RN> micro_kernel_;
 
-    float *packA, *packB;
-    packA = malloc_aligned<float>(KC, MC + 1, sizeof(float));
-    packB = malloc_aligned<float>(KC, NC + 1, sizeof(float));
+    // packing matrix A following row-major order
+    void PackMatrixA(int m, int k, const TA *sub_A, int offset, TA *packA) {
+        int i, p;
+        const TA *src[RM];
 
-    // iterate row of A
-    for (ic = 0; ic < m; ic += MC) {
-        min_m = std::min(m - ic, MC);
-
-        // col of A, row of B
-        for (pc = 0; pc < k; pc += KC) {
-            min_k = std::min(k - pc, KC);
-
-            // n = 1, so do not need third loop of n
-            // pack matrix A
-            for (int i = 0; i < min_m; i += MR) {
-                PackMatrixA<MR, NR, MC, KC, NC>(
-                    std::min(min_m - i, MR), 
-                    min_k, 
-                    &A[(ic + i) * lda + pc], 
-                    lda, 
-                    0, 
-                    &packA[i * min_k]
-                );
+        for (i = 0; i < RM; ++i) {
+            if (i < m) {
+                src[i] = &sub_A[(offset + i) * lda_];
             }
+            else {
+                src[i] = &sub_A[(offset + 0) * lda_];
+            }
+        }
 
-            // pack B
-            min_n = n;
-            PackMatrixB(min_k, min_n, &B[pc], ldb, 0, packB);
-
-            // micro kernel
-            for (int i = 0; i < min_m; i += MR) {
-                AddDot_4x1<MR, NR>(
-                    min_k,
-                    &packA[i * min_k],         // A block
-                    packB,                     // B block (n=1)
-                    &C[(ic + i) * ldc],        // C block
-                    ldc
-                );
+        // colnum-major order packing for (i = 0; i < RM; ++i)
+        for (i = 0; i < RM; ++i) {
+            for (p = 0; p < k; ++p) {
+                *packA = src[i][p];
+                packA++;
             }
         }
     }
-    free(packA);
-    free(packB);
-}
+
+    // packing vector A，just copy B to aligned packB
+    void PackMatrixB(int k, int n, const TB *sub_B, int offset, TB *packB) {
+        std::memcpy(packB, sub_B + offset, RN * k * sizeof(TB));
+    }
+
+public:
+    GEMM(const TA *A, int lda, 
+         const TB *B, int ldb, 
+         TC *C, int ldc, 
+         MicroKernelType<TA, TB, TC, RM, RN> micro_kernel) :
+            A_(A), lda_(lda), 
+            B_(B), ldb_(ldb), 
+            C_(C), ldc_(ldc), 
+            micro_kernel_(micro_kernel) {};
+    
+    void multiply(int m, int n, int k) {
+        // int i, j, p;
+        int ic, jc, pc;
+        int min_m, min_k, min_n;
+
+        TA *packA; 
+        TB *packB;
+        packA = malloc_aligned<TA>(CK, CM + 1, sizeof(TA));
+        packB = malloc_aligned<TB>(CK, CN + 1, sizeof(TB));
+
+        // iterate row of A
+        for (ic = 0; ic < m; ic += CM) {
+            min_m = std::min(m - ic, CM);
+
+            // col of A, row of B
+            for (pc = 0; pc < k; pc += CK) {
+                min_k = std::min(k - pc, CK);
+
+                // n = 1, so do not need third loop of n
+                // pack matrix A
+                for (int i = 0; i < min_m; i += RM) {
+                    PackMatrixA(
+                        std::min(min_m - i, RM), 
+                        min_k, 
+                        &A_[(ic + i) * lda_ + pc], 
+                        0, 
+                        &packA[i * min_k]
+                    );
+                }
+
+                // pack B
+                min_n = n;
+                PackMatrixB(min_k, min_n, &B_[pc], 0, packB);
+
+                // micro kernel
+                for (int i = 0; i < min_m; i += RM) {
+                    micro_kernel_(
+                        min_k,
+                        &packA[i * min_k],         // A block
+                        packB,                     // B block (n=1)
+                        &C_[(ic + i) * ldc_],        // C block
+                        ldc_
+                    );
+                }
+            }
+        }
+        free(packA);
+        free(packB);
+    }
+};
 
 // W (d,n) @ x (n,1) -> xout (d,)
 // w: d x n, row-major
@@ -373,12 +397,76 @@ inline void matmul(float* xout, float* x, float* w, int n, int d) {
     int lda = k;
     int ldb = nn;
     int ldc = nn;
-    constexpr int MR = 4, NR = 1, MC = 72, KC = 256, NC = 1020;
+    constexpr int MR = 4, NR = 1, MC = 72, KC = 512, NC = 1020;
     float *C = malloc_aligned<float>(m, nn, sizeof(float));
-    gemm<MR, NR, MC, KC, NC>(m, nn, k, w, lda, x, ldb, C, ldc);
+    // gemm<MR, NR, MC, KC, NC>(m, nn, k, w, lda, x, ldb, C, ldc);
+
+    MicroKernelType<float, float, float, MR, NR> micro_kernel;
+    micro_kernel = &AddDot_4x1;
+    GEMM<float, float, float, MR, NR, MC, KC, NC> gemm(
+        w, lda, x, ldb, C, ldc, 
+        micro_kernel
+    );
+    gemm.multiply(m, nn, k);
     std::memcpy(xout, C, m * nn * sizeof(float));
     free(C);
 }
+
+
+template <typename TA, typename TB, typename TC, 
+          int RM = 4, int RN = 1, 
+          int CM = 72, int CK = 256, int CN = 1020>
+class GEMM_Q0 {
+private:
+    const TA *const A_;
+    const TB *const B_;
+    TC *const C_;
+
+    const int lda_;
+    const int ldb_;
+    const int ldc_;
+
+    MicroKernelType<TA, TB, TC, RM, RN> micro_kernel_;
+
+    // packing matrix A following row-major order
+    void PackMatrixA(int m, int k, const TA *sub_A, int offset, TA *packA) {
+        int i, p;
+        const int8_t* src_row[RM];
+        const auto &src_q = sub_A->q;
+        const auto &src_s = sub_A->s;
+
+        for (i = 0; i < RM; ++i) {
+            if (i < m) {
+                src_row[i] = &src_q[(offset + i) * lda];
+            }
+            else {
+                src_row[i] = &src_q[(offset + 0) * lda];
+            }
+        }
+
+        for (i = 0; i < RM; ++i) {
+            for (p = 0; p < k; ++p) {
+                // record the position of current element on sub-matrix A
+                // this for compute index of block for scalar factor
+                int pos_in_sub = i * lda_ + p; 
+
+                // 1) packing quant value 
+                int8_t q_value = src_row[i][p];
+                packA->q.push_back(q_value);
+
+                // 2) compute index of block for packing scalar factor
+                int block_index = pos_in_sub / GS;
+                if (block_index >= src_s.size()) {
+                    throw std::out_of_range("PackMatrixA: block_idx exceeds src_s size");
+                }
+                float s_value = src_s[block_index];
+                packA->s[block_index] = s_value;
+            }
+        }
+    }
+
+}
+
 
 
 #endif // GEMM_HPP_
