@@ -413,7 +413,7 @@ inline void matmul(float* xout, float* x, float* w, int n, int d) {
 }
 
 
-template <typename TA, typename TB, typename TC, 
+template <int GS, typename TA, typename TB, typename TC, 
           int RM = 4, int RN = 1, 
           int CM = 72, int CK = 256, int CN = 1020>
 class GEMM_Q0 {
@@ -429,40 +429,48 @@ private:
     MicroKernelType<TA, TB, TC, RM, RN> micro_kernel_;
 
     // packing matrix A following row-major order
-    void PackMatrixA(int m, int k, const TA *sub_A, int offset, TA *packA) {
+    void PackMatrixA(int m, int k, const TA *sub_A, int row_offset, int col_offset, TA *packA, int pack_offset) {
         int i, p;
         const int8_t* src_row[RM];
         const auto &src_q = sub_A->q;
         const auto &src_s = sub_A->s;
 
+        // each ptr points to each row of sub-matrix A 
         for (i = 0; i < RM; ++i) {
             if (i < m) {
-                src_row[i] = &src_q[(offset + i) * lda];
+                src_row[i] = &src_q[(row_offset + i) * lda_ + col_offset];
             }
             else {
-                src_row[i] = &src_q[(offset + 0) * lda];
+                src_row[i] = &src_q[(row_offset + 0) * lda_ + col_offset];
             }
         }
 
+        // row-major packing: row->col write to packA
         for (i = 0; i < RM; ++i) {
+            // cache index of current row 
+            const int8_t *current_row_index = src_row[i];
+            const int abs_row_index = row_offset + (i < m ? i : 0);
             for (p = 0; p < k; ++p) {
-                // record the position of current element on sub-matrix A
-                // this for compute index of block for scalar factor
-                int pos_in_sub = i * lda_ + p; 
+                // row-major indexing
+                int packed_index = pack_offset + i * k + p;
+                int packed_tile_index = packed_index / GS;
+                int src_index = abs_row_index * lda_ + (col_offset + p);
+                int src_tile_index = src_index / GS;
+            
+                // 1. packing quant value
+                packA->q[packed_index] = current_row_index[p];
 
-                // 1) packing quant value 
-                int8_t q_value = src_row[i][p];
-                packA->q.push_back(q_value);
-
-                // 2) compute index of block for packing scalar factor
-                int block_index = pos_in_sub / GS;
-                if (block_index >= src_s.size()) {
-                    throw std::out_of_range("PackMatrixA: block_idx exceeds src_s size");
-                }
-                float s_value = src_s[block_index];
-                packA->s[block_index] = s_value;
+                // 2. packing scalar factor
+                packA->s[packed_tile_index] = src_s[src_tile_index];
             }
-        }
+        }  
+    }
+
+    void PackMatrixB(int k, int n, const TB *sub_B, int row_offset, int col_offset, TB *packB, int pack_offset) {
+        const auto &src_q = sub_B->q;
+        const auto &src_s = sub_B->s;
+        std::memcpy(packB->q.data(), &src_q[pack_offset], RN * k * sizeof(TB));
+        std::memcpy(packB->s.data(), &src_s[pack_offset / GS], RN * k * sizeof(TB));
     }
 
 }
