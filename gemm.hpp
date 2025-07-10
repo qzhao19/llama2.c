@@ -4,12 +4,13 @@
 #include <cmath>
 #include <cstring>
 #include <new>
+#include <vector>
 
-#undef MIN
-#undef MAX
+// #undef MIN
+// #undef MAX
 
-#define MIN(a, b) ((a) < (b) ? (a) : (b))
-#define MAX(a, b) ((a) > (b) ? (a) : (b))
+// #define MIN(a, b) ((a) < (b) ? (a) : (b))
+// #define MAX(a, b) ((a) > (b) ? (a) : (b))
 
 #if defined(__SSE__)
 #include <smmintrin.h>
@@ -146,6 +147,43 @@ T* malloc_aligned(int m, int n, int size) {
     std::memset(ptr, 0, m * n * size);
 
     return static_cast<T*>(ptr);
+}
+
+struct QuantizedTensor {
+    std::vector<std::int8_t> q;   // quantized values
+    std::vector<float> s;         // scaling factors
+};
+using QuantizedTensorType = QuantizedTensor;
+
+
+
+template <>
+QuantizedTensorType* malloc_aligned(int m, int n, int size) {
+    auto* ptr = static_cast<QuantizedTensorType*>(
+        std::aligned_alloc(MEMORY_ALIGNMENT, size)
+    );
+
+    if (!ptr) {
+        throw std::bad_alloc();
+    }
+
+    // use placement new to construct object
+    new (ptr) QuantizedTensorType();
+
+    std::vector<std::int8_t> q_vec(m * n, 0);
+    const int GS = 32;
+    std::vector<float> s_vec((m * n + GS - 1) / GS, 0.0f);
+
+    ptr->q = std::move(q_vec);
+    ptr->s = std::move(s_vec);
+
+    return ptr;
+}
+
+void free_aligned(QuantizedTensorType* ptr) noexcept {
+    if (!ptr) return;
+    ptr->~QuantizedTensorType();
+    std::free(ptr);
 }
 
 template <typename TA, typename TB, typename TC, int MR = 4, int NR = 1>
@@ -413,6 +451,13 @@ inline void matmul(float* xout, float* x, float* w, int n, int d) {
 }
 
 
+
+// template <typename TA, typename TB, typename TC, int MR = 4, int NR = 1>
+// inline void AddDot_4x1_Q0(int k, TA *a, TB *b, TC *c, int ldc) {
+
+// }
+
+
 template <int GS, typename TA, typename TB, typename TC, 
           int RM = 4, int RN = 1, 
           int CM = 72, int CK = 256, int CN = 1020>
@@ -469,11 +514,79 @@ private:
     void PackMatrixB(int k, int n, const TB *sub_B, int row_offset, int col_offset, TB *packB, int pack_offset) {
         const auto &src_q = sub_B->q;
         const auto &src_s = sub_B->s;
-        std::memcpy(packB->q.data(), &src_q[pack_offset], RN * k * sizeof(TB));
-        std::memcpy(packB->s.data(), &src_s[pack_offset / GS], RN * k * sizeof(TB));
+
+        // col_offset = 0, 
+        int src_index = row_offset + ldb_ * col_offset;
+        
+        // 1. packing quant value
+        std::memcpy(&packB->q[pack_offset], &src_q[src_index], RN * k * sizeof(decltype(src_q[0])));
+
+        // 2. pack scalar factor
+        std::memcpy(&packB->s[pack_offset / GS], &src_s[src_index / GS], RN * (k + 31) / GS * sizeof(decltype(src_s[0])));
     }
 
-}
+public:
+
+    GEMM_Q0(const TA *A, int lda, 
+            const TB *B, int ldb, 
+            TC *C, int ldc, 
+            MicroKernelType<TA, TB, TC, RM, RN> micro_kernel) :
+            A_(A), lda_(lda), 
+            B_(B), ldb_(ldb), 
+            C_(C), ldc_(ldc), 
+            micro_kernel_(micro_kernel) {};
+
+    void multiply(int m, int n, int k) {
+        // int i, j, p;
+        int ic, jc, pc;
+        int min_m, min_k, min_n;
+
+        TA *packA; 
+        TB *packB;
+        packA = malloc_aligned<TA>(CK, CM + 1, sizeof(TA));
+        packB = malloc_aligned<TB>(CK, CN + 1, sizeof(TB));
+
+        // iterate row of A
+        for (ic = 0; ic < m; ic += CM) {
+            min_m = std::min(m - ic, CM);
+
+            // col of A, row of B
+            for (pc = 0; pc < k; pc += CK) {
+                min_k = std::min(k - pc, CK);
+
+                // n = 1, so do not need third loop of n
+                // pack matrix A
+                for (int i = 0; i < min_m; i += RM) {
+                    PackMatrixA(
+                        std::min(min_m - i, RM), min_k, 
+                        &A_[(ic + i) * lda_ + pc], 
+                        ic, pc,
+                        packA,
+                        i * min_k
+                    );
+                }
+
+                // pack B
+                // min_n = n;
+                // PackMatrixB(min_k, min_n, &B_[pc], 0, packB);
+
+                // // micro kernel
+                // for (int i = 0; i < min_m; i += RM) {
+                //     micro_kernel_(
+                //         min_k,
+                //         &packA[i * min_k],         // A block
+                //         packB,                     // B block (n=1)
+                //         &C_[(ic + i) * ldc_],        // C block
+                //         ldc_
+                //     );
+                // }
+            }
+        }
+        free_aligned(packA);
+        free_aligned(packB);
+    }
+
+};
 
 
 
