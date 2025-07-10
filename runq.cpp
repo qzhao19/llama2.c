@@ -287,4 +287,227 @@ std::vector<float> Transformer::forward(int token, int pos) {
     return model_->state->logits;
 }
 
+// ----------------------------------------------------------------------------
+// generation loop
 
+void generate(Transformer &transformer, Tokenizer &tokenizer, Sampler &sampler, std::string& prompt, int steps) {
+    std::string empty_prompt(1, '\0');
+    if (prompt.empty()) {
+        prompt = empty_prompt;
+    }
+
+    // encode the (string) prompt into tokens sequence
+    int num_prompt_tokens = 0;
+    std::vector<int> prompt_tokens(std::strlen(prompt.c_str()) + 3);
+    tokenizer.encode(prompt, 1, 0, prompt_tokens, num_prompt_tokens);
+    if (num_prompt_tokens < 1) {
+        std::ostringstream err_msg;
+        err_msg << "something is wrong, expected at least 1 prompt token.";
+        throw std::runtime_error(err_msg.str());
+
+    }
+
+    // start the main loop
+    long start = 0;  // used to time our code, only initialized after first iteration
+    int next;        // will store the next token in the sequence
+    int token = prompt_tokens[0]; // kick off with the first token in the prompt
+    int pos = 0;     // position in the sequence
+    while (pos < steps) {
+        // forward the transformer to get logits for the next token
+        std::vector<float> logits = transformer.forward(token, pos);
+
+        // advance the state machine
+        if (pos < num_prompt_tokens - 1) {
+            // if we are still processing the input prompt, force the next prompt token
+            next = prompt_tokens[pos + 1];
+        } else {
+            // otherwise sample the next token from the logits
+            next = sampler.sample(logits);
+        }
+        pos++;
+
+        // data-dependent terminating condition: the BOS (=1) token delimits sequences
+        if (next == 1) { break; }
+
+        // print the token as string, decode it with the Tokenizer object
+        std::string piece = tokenizer.decode(token, next);
+        safe_print(piece); // same as printf("%s", piece), but skips "unsafe" bytes
+        fflush(stdout);
+        token = next;
+
+        // init the timer here because the first iteration can be slower
+        if (start == 0) { start = time_in_ms(); }
+
+    }
+    std::cout << "\n";
+
+    // report achieved tok/s (pos-1 because the timer starts after first iteration)
+    if (pos > 1) {
+        long end = time_in_ms();
+        std::cerr << "achieved tok/s: " << (pos-1) / static_cast<double>(end-start) * 1000 << std::endl;
+    }
+}
+
+// ----------------------------------------------------------------------------
+// chat loop
+
+void chat(Transformer &transformer, Tokenizer &tokenizer, Sampler &sampler,
+          std::string& cli_user_prompt, std::string& cli_system_prompt, int steps) {
+
+    // buffers for reading the system prompt and user prompt from stdin
+    // you'll notice they are soomewhat haphazardly and unsafely set atm
+    std::string system_prompt;
+    std::string user_prompt;
+    std::string rendered_prompt;
+    int num_prompt_tokens = 0;
+    // std::unique_ptr<int[]> prompt_tokens = std::make_unique<int[]>(1152);
+    std::vector<int> prompt_tokens(1152);
+    int user_idx;
+
+    // start the main loop
+    int8_t user_turn = 1; // user starts
+    int next;        // will store the next token in the sequence
+    int token;       // stores the current token to feed into the transformer
+    int prev_token;
+    int pos = 0;     // position in the sequence
+    while (pos < steps) {
+        // when it is the user's turn to contribute tokens to the dialog...
+        if (user_turn) {
+            // get the (optional) system prompt at position 0
+            if (pos == 0) {
+                // at position 0, the user can also contribute a system prompt
+                if (cli_system_prompt.empty()) {
+                    // system prompt was not passed in, attempt to get it from stdin
+                    read_stdin("Enter system prompt (optional): ", system_prompt, sizeof(system_prompt));
+                } else {
+                    // system prompt was passed in, use it
+                    system_prompt = cli_system_prompt;
+                }
+            }
+            // get the user prompt
+            if (pos == 0 && !cli_user_prompt.empty()) {
+                // user prompt for position 0 was passed in, use it
+                user_prompt = cli_user_prompt;
+            } else {
+                // otherwise get user prompt from stdin
+                read_stdin("User: ", user_prompt, sizeof(user_prompt));
+            }
+            // render user/system prompts into the Llama 2 Chat schema
+            if (pos == 0 && !system_prompt.empty()) {
+                std::string system_template = "[INST] <<SYS>>\n" + system_prompt + "\n<</SYS>>\n\n" + user_prompt + " [/INST]";
+                rendered_prompt = system_template;
+            } else {
+                std::string user_template = "[INST] " + user_prompt + " [/INST]";
+                rendered_prompt = user_template;
+            }
+            // encode the rendered prompt into tokens
+            tokenizer.encode(rendered_prompt, 1, 0, prompt_tokens, num_prompt_tokens);
+            user_idx = 0; // reset the user index
+            user_turn = 0;
+            std::cout<<"Assistant: ";
+        }
+
+        // determine the token to pass into the transformer next
+        if (user_idx < num_prompt_tokens) {
+            // if we are still processing the input prompt, force the next prompt token
+            token = prompt_tokens[user_idx++];
+        } else {
+            // otherwise use the next token sampled from previous turn
+            token = next;
+        }
+        // EOS (=2) token ends the Assistant turn
+        if (token == 2) { user_turn = 1; }
+
+        // forward the transformer to get logits for the next token
+        std::vector<float> logits = transformer.forward(token, pos);
+        next = sampler.sample(logits);
+        pos++;
+
+        if (user_idx >= num_prompt_tokens && next != 2) {
+            // the Assistant is responding, so print its output
+            std::string piece = tokenizer.decode(token, next);
+            safe_print(piece); // same as printf("%s", piece), but skips "unsafe" bytes
+            fflush(stdout);
+        }
+        if (next == 2) { std::cout<<"\n"; }
+    }
+    std::cout<<"\n";
+}
+
+// ----------------------------------------------------------------------------
+// CLI, include only if not testing
+#ifndef TESTING
+
+void error_usage() {
+    std::cerr << R"(Usage:   run <checkpoint> [options]
+Example: run model.bin -n 256 -i "Once upon a time"
+Options:
+  -t <float>  temperature in [0,inf], default 1.0
+  -p <float>  p value in top-p (nucleus) sampling in [0,1] default 0.9
+  -s <int>    random seed, default time(NULL)
+  -n <int>    number of steps to run for, default 256. 0 = max_seq_len
+  -i <string> input prompt
+  -z <string> optional path to custom tokenizer
+  -m <string> mode: generate|chat, default: generate
+  -y <string> (optional) system prompt in chat mode
+)";
+    std::exit(EXIT_FAILURE);
+}
+
+int main(int argc, char* argv[]) {
+    std::string ckpt_path;
+    std::string tokenizer_path = "tokenizer.bin";
+    float temperature = 1.0f;   // 0.0 = greedy deterministic. 1.0 = original. don't set higher
+    float topp = 0.9f;          // top-p in nucleus sampling. 1.0 = off. 0.9 works well, but slower
+    int steps = 256;            // number of steps to run for
+    std::string prompt;
+    unsigned long long rng_seed = 0; // seed rng with time by default
+    std::string mode = "generate";
+    std::string system_prompt;
+
+    // poor man's C argparse so we can override the defaults above from the command line
+    if (argc >= 2) { ckpt_path = argv[1]; } else { error_usage(); }
+    for (int i = 2; i < argc; i+=2) {
+        // do some basic validation
+        if (i + 1 >= argc) { error_usage(); } // must have arg after flag
+        if (argv[i][0] != '-') { error_usage(); } // must start with dash
+        if (strlen(argv[i]) != 2) { error_usage(); } // must be -x (one dash, one letter)
+        // read in the args
+        if (argv[i][1] == 't') { temperature = atof(argv[i + 1]); }
+        else if (argv[i][1] == 'p') { topp = atof(argv[i + 1]); }
+        else if (argv[i][1] == 's') { rng_seed = atoi(argv[i + 1]); }
+        else if (argv[i][1] == 'n') { steps = atoi(argv[i + 1]); }
+        else if (argv[i][1] == 'i') { prompt = argv[i + 1]; }
+        else if (argv[i][1] == 'z') { tokenizer_path = argv[i + 1]; }
+        else if (argv[i][1] == 'm') { mode = argv[i + 1]; }
+        else if (argv[i][1] == 'y') { system_prompt = argv[i + 1]; }
+        else { error_usage(); }
+    }
+    // parameter validation/overrides
+    if (rng_seed <= 0) rng_seed = (unsigned int)time(NULL);
+    if (temperature < 0.0) temperature = 0.0;
+    if (topp < 0.0 || 1.0 < topp) topp = 0.9;
+    if (steps < 0) steps = 0;
+
+    Transformer transformer;
+    transformer.load_model(ckpt_path);
+    int vocab_size = transformer.get_vocab_size();
+    int seq_len = transformer.get_seq_len();
+
+    if (steps == 0 || steps > seq_len) steps = seq_len; // ovrerride to ~max length
+    Tokenizer tokenizer(tokenizer_path, vocab_size);
+    Sampler sampler(vocab_size, temperature, topp, rng_seed);
+
+    // run!
+    if (mode == "generate") {
+        generate(transformer, tokenizer, sampler, prompt, steps);
+    } else if (mode == "chat") {
+        chat(transformer, tokenizer, sampler, prompt, system_prompt, steps);
+    } else {
+        std::cerr << "unknown mode: " << mode << "\n" <<std::endl;
+        error_usage();
+    }
+
+    return 0;
+}
+#endif
