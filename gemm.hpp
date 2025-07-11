@@ -452,10 +452,31 @@ inline void matmul(float* xout, float* x, float* w, int n, int d) {
 
 
 
-// template <typename TA, typename TB, typename TC, int MR = 4, int NR = 1>
-// inline void AddDot_4x1_Q0(int k, TA *a, TB *b, TC *c, int ldc) {
+template <int GS, typename TA, typename TB, typename TC, int MR = 4, int NR = 1>
+inline void AddDot_4x1_Q0(int k, TA *a, TB *b, TC *c, int ldc) {
+    TC c_00 = 0.0;
+    TC c_10 = 0.0;
+    TC c_20 = 0.0;
+    TC c_30 = 0.0;
 
-// }
+    int group;
+    for (group = 0; group < (k + GS - 1) / GS; ++group) {
+        int g_begin = group * GS;
+        int g_end = std::min(group_start + GS, k);
+
+        float a_scale = a->s[group];
+        float b_scale = b->s[group];
+        
+        int32_t ival_00 = 0;
+        int32_t ival_10 = 0;
+        int32_t ival_20 = 0;
+        int32_t ival_30 = 0;
+
+        
+
+    }
+
+}
 
 
 template <int GS, typename TA, typename TB, typename TC, 
@@ -567,8 +588,8 @@ public:
                 }
 
                 // pack B
-                // min_n = n;
-                // PackMatrixB(min_k, min_n, &B_[pc], 0, packB);
+                min_n = n;
+                PackMatrixB(min_k, min_n, &B_[pc * ldb_], 0, 0, packB, 0);
 
                 // // micro kernel
                 // for (int i = 0; i < min_m; i += RM) {
