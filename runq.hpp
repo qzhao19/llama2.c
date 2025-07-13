@@ -77,28 +77,27 @@ inline void matmul(float* xout, QuantizedTensorType *x, QuantizedTensorType *w, 
     int i;
     #pragma omp parallel for private(i)
     for (i = 0; i < d; i++) {
-
         float val = 0.0f;
         int32_t ival = 0;
-        int in = i * n;
+        int row_index = i * n;
 
-        // do the matmul in groups of GS
-        int j;
-        for (j = 0; j <= n - GS; j += GS) {
-            for (int k = 0; k < GS; k++) {
-                ival += ((int32_t) x->q[j + k]) * ((int32_t) w->q[in + j + k]);
-            }
-            val += ((float) ival) * w->s[(in + j) / GS] * x->s[j / GS];
+        int group;
+        for (group = 0; group < (n + GS - 1) / GS; ++group) {
+            int begin = group * GS;
+            int end = std::min(begin + GS, n);
             ival = 0;
-        }
 
+            for (int k = begin; k < end; ++k) {
+                ival += static_cast<int32_t>(x->q[k]) * static_cast<int32_t>(w->q[row_index + k]);
+            }
+            val += ((float) ival) * w->s[(row_index + begin) / GS] * x->s[group];
+        }
         xout[i] = val;
     }
 }
 
 // ----------------------------------------------------------------------------
 // struct definitions
-
 
 
 // all weights params of model
