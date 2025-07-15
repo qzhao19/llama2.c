@@ -90,7 +90,7 @@ inline void matmul(float* xout, QuantizedTensorType *x, QuantizedTensorType *w, 
             for (int k = begin; k < end; ++k) {
                 ival += static_cast<int32_t>(x->q[k]) * static_cast<int32_t>(w->q[row_index + k]);
             }
-            val += ((float) ival) * w->s[(row_index + begin) / GS] * x->s[group];
+            val += static_cast<float>(ival) * w->s[(row_index + begin) / GS] * x->s[group];
         }
         xout[i] = val;
     }
