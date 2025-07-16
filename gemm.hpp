@@ -6,12 +6,6 @@
 #include <new>
 #include <vector>
 
-// #undef MIN
-// #undef MAX
-
-// #define MIN(a, b) ((a) < (b) ? (a) : (b))
-// #define MAX(a, b) ((a) > (b) ? (a) : (b))
-
 #if defined(__SSE__)
 #include <smmintrin.h>
 #endif
@@ -119,6 +113,12 @@ inline __m256 set1<__m256>(float x) { return _mm256_set1_ps(x); }
 #define MEMORY_ALIGNMENT 32
 #define UNROLLING_SIZE 16
 
+struct QuantizedTensor {
+    std::vector<std::int8_t> q;   // quantized values
+    std::vector<float> s;         // scaling factors
+};
+using QuantizedTensorType = QuantizedTensor;
+
 inline void matmul_ref(float* xout, float* x, float* w, int n, int d) {
     // W (d,n) @ x (n,) -> xout (d,)
     // by far the most amount of time is spent inside this little function
@@ -132,6 +132,33 @@ inline void matmul_ref(float* xout, float* x, float* w, int n, int d) {
         xout[i] = val;
     }
 };
+
+inline void matmul_ref(float* xout, QuantizedTensorType *x, QuantizedTensorType *w, int n, int d) {
+    int i;
+    int GS = 32;
+    #pragma omp parallel for private(i)
+    for (i = 0; i < d; i++) {
+        float val = 0.0f;
+        int32_t ival = 0;
+        int row_index = i * n;
+
+        int group;
+        for (group = 0; group < (n + GS - 1) / GS; ++group) {
+            int begin = group * GS;
+            int end = std::min(begin + GS, n);
+            ival = 0;
+
+            for (int k = begin; k < end; ++k) {
+                ival += static_cast<int32_t>(x->q[k]) * static_cast<int32_t>(w->q[row_index + k]);
+            }
+
+            val += ((float) ival) * w->s[(row_index + begin) / GS] * x->s[group];
+            
+        }
+        xout[i] = val;
+    }
+}
+
 
 template <typename T>
 T* malloc_aligned(int m, int n, int size) {
@@ -148,14 +175,6 @@ T* malloc_aligned(int m, int n, int size) {
 
     return static_cast<T*>(ptr);
 }
-
-struct QuantizedTensor {
-    std::vector<std::int8_t> q;   // quantized values
-    std::vector<float> s;         // scaling factors
-};
-using QuantizedTensorType = QuantizedTensor;
-
-
 
 template <>
 QuantizedTensorType* malloc_aligned(int m, int n, int size) {
@@ -186,7 +205,7 @@ void free_aligned(QuantizedTensorType* ptr) noexcept {
     std::free(ptr);
 }
 
-template <typename TA, typename TB, typename TC, int MR = 4, int NR = 1>
+template <typename TA, typename TB, typename TC, int RM = 4, int RN = 1>
 inline void AddDot_4x1(int k, TA *a, TB *b, TC *c, int ldc) {
     TC c_00, c_10, c_20, c_30;
     c_00 = 0.0;
@@ -435,13 +454,13 @@ inline void matmul(float* xout, float* x, float* w, int n, int d) {
     int lda = k;
     int ldb = nn;
     int ldc = nn;
-    constexpr int MR = 4, NR = 1, MC = 72, KC = 512, NC = 1020;
+    constexpr int RM = 4, RN = 1, CM = 72, Ck = 512, CN = 1020;
     float *C = malloc_aligned<float>(m, nn, sizeof(float));
     // gemm<MR, NR, MC, KC, NC>(m, nn, k, w, lda, x, ldb, C, ldc);
 
-    MicroKernelType<float, float, float, MR, NR> micro_kernel;
+    MicroKernelType<float, float, float, RM, RN> micro_kernel;
     micro_kernel = &AddDot_4x1;
-    GEMM<float, float, float, MR, NR, MC, KC, NC> gemm(
+    GEMM<float, float, float, RM, RN, CM, Ck, CN> gemm(
         w, lda, x, ldb, C, ldc, 
         micro_kernel
     );
@@ -450,34 +469,55 @@ inline void matmul(float* xout, float* x, float* w, int n, int d) {
     free(C);
 }
 
+// ----------------------------------------------------------------------------
 
-
-template <int GS, typename TA, typename TB, typename TC, int MR = 4, int NR = 1>
-inline void AddDot_4x1_Q0(int k, TA *a, TB *b, TC *c, int ldc) {
-    TC c_00 = 0.0;
-    TC c_10 = 0.0;
-    TC c_20 = 0.0;
-    TC c_30 = 0.0;
+template <int GS, typename TA, typename TB, typename TC, int RM = 4, int RN = 1>
+inline void AddDot_4x1_Q0(int k, const TA *a, int offset_A, const TB *b, int offset_B, TC *c, int ldc) {
+    TC c_00_reg, c_10_reg, c_20_reg, c_30_reg;
+    c_00_reg = 0.0;
+    c_10_reg = 0.0;
+    c_20_reg = 0.0;
+    c_30_reg = 0.0;
 
     int group;
     for (group = 0; group < (k + GS - 1) / GS; ++group) {
-        int g_begin = group * GS;
-        int g_end = std::min(group_start + GS, k);
+        int begin = group * GS;
+        int end = std::min(begin + GS, k);
 
-        float a_scale = a->s[group];
-        float b_scale = b->s[group];
-        
-        int32_t ival_00 = 0;
-        int32_t ival_10 = 0;
-        int32_t ival_20 = 0;
-        int32_t ival_30 = 0;
+        int32_t acc_00 = 0, acc_10 = 0, acc_20 = 0, acc_30 = 0;
+        for (int p = begin; p <end; ++p) {
+            int a_index_0p = offset_A + 0 * k + p;
+            int a_index_1p = offset_A + 1 * k + p;
+            int a_index_2p = offset_A + 2 * k + p;
+            int a_index_3p = offset_A + 3 * k + p;
+            int b_index_p0 = offset_B + p;
 
-        
+            acc_00 += static_cast<int32_t>(a->q[a_index_0p]) * static_cast<int32_t>(b->q[b_index_p0]);
+            acc_10 += static_cast<int32_t>(a->q[a_index_1p]) * static_cast<int32_t>(b->q[b_index_p0]);
+            acc_20 += static_cast<int32_t>(a->q[a_index_2p]) * static_cast<int32_t>(b->q[b_index_p0]);
+            acc_30 += static_cast<int32_t>(a->q[a_index_3p]) * static_cast<int32_t>(b->q[b_index_p0]);
+        }
 
+        float a_s0 = a->s[(offset_A + 0 * k + begin) / GS];
+        float a_s1 = a->s[(offset_A + 1 * k + begin) / GS];
+        float a_s2 = a->s[(offset_A + 2 * k + begin) / GS];
+        float a_s3 = a->s[(offset_A + 3 * k + begin) / GS];
+        float b_s = b->s[(offset_B + begin) / GS];
+
+        c_00_reg += static_cast<TC>(acc_00) * a_s0 * b_s;
+        c_10_reg += static_cast<TC>(acc_10) * a_s1 * b_s;
+        c_20_reg += static_cast<TC>(acc_20) * a_s2 * b_s;
+        c_30_reg += static_cast<TC>(acc_30) * a_s3 * b_s;
     }
 
+    c[0 * ldc + 0] += c_00_reg;
+    c[1 * ldc + 0] += c_10_reg;
+    c[2 * ldc + 0] += c_20_reg;
+    c[3 * ldc + 0] += c_30_reg;
 }
 
+template <int GS, typename TA, typename TB, typename TC, int RM, int RN>
+using MicroKernelQ0Type = void (*)(int, const TA*, int, const TB*, int, TC*, int);
 
 template <int GS, typename TA, typename TB, typename TC, 
           int RM = 4, int RN = 1, 
@@ -492,58 +532,58 @@ private:
     const int ldb_;
     const int ldc_;
 
-    MicroKernelType<TA, TB, TC, RM, RN> micro_kernel_;
+    MicroKernelQ0Type<GS, TA, TB, TC, RM, RN> micro_kernel_;
 
     // packing matrix A following row-major order
-    void PackMatrixA(int m, int k, const TA *sub_A, int row_offset, int col_offset, TA *packA, int pack_offset) {
+    void PackMatrixA(int m, int k, const TA *A, int row_offset, int col_offset, TA *packA, int pack_offset) {
+        const auto &src_q = A->q;
+        const auto &src_s = A->s;
+        
+        using QType = typename decltype(A->q)::value_type;
+        const QType *src_q_row[RM];
+        
         int i, p;
-        const int8_t* src_row[RM];
-        const auto &src_q = sub_A->q;
-        const auto &src_s = sub_A->s;
-
-        // each ptr points to each row of sub-matrix A 
         for (i = 0; i < RM; ++i) {
             if (i < m) {
-                src_row[i] = &src_q[(row_offset + i) * lda_ + col_offset];
+                src_q_row[i] = &src_q[(row_offset + i) * lda_ + col_offset];
             }
             else {
-                src_row[i] = &src_q[(row_offset + 0) * lda_ + col_offset];
+                src_q_row[i] = &src_q[(row_offset + 0) * lda_ + col_offset];
             }
         }
 
-        // row-major packing: row->col write to packA
         for (i = 0; i < RM; ++i) {
-            // cache index of current row 
-            const int8_t *current_row_index = src_row[i];
+            const QType *current_q_row_index = src_q_row[i];
             const int abs_row_index = row_offset + (i < m ? i : 0);
             for (p = 0; p < k; ++p) {
-                // row-major indexing
-                int packed_index = pack_offset + i * k + p;
-                int packed_tile_index = packed_index / GS;
-                int src_index = abs_row_index * lda_ + (col_offset + p);
-                int src_tile_index = src_index / GS;
-            
-                // 1. packing quant value
-                packA->q[packed_index] = current_row_index[p];
+                int dst_q_index = pack_offset + i * k + p;
+                int dst_s_index = dst_q_index / GS;
+                int src_q_index = abs_row_index * lda_ + col_offset + p;
+                int src_s_index = src_q_index / GS;
 
-                // 2. packing scalar factor
-                packA->s[packed_tile_index] = src_s[src_tile_index];
+                // packing q & s
+                packA->q[dst_q_index] = current_q_row_index[p];
+                packA->s[dst_s_index] = src_s[src_s_index];
             }
-        }  
+        }
     }
 
-    void PackMatrixB(int k, int n, const TB *sub_B, int row_offset, int col_offset, TB *packB, int pack_offset) {
-        const auto &src_q = sub_B->q;
-        const auto &src_s = sub_B->s;
+    void PackMatrixB(int k, int n, const TB *B, int row_offset, int col_offset, TB *packB, int pack_offset) {
+        const auto &src_q = B->q;
+        const auto &src_s = B->s;
 
-        // col_offset = 0, 
-        int src_index = row_offset + ldb_ * col_offset;
-        
-        // 1. packing quant value
-        std::memcpy(&packB->q[pack_offset], &src_q[src_index], RN * k * sizeof(decltype(src_q[0])));
-
-        // 2. pack scalar factor
-        std::memcpy(&packB->s[pack_offset / GS], &src_s[src_index / GS], RN * (k + 31) / GS * sizeof(decltype(src_s[0])));
+        int i, j;
+        for (j = 0; j < n; ++j) {
+            for (i = 0; i < k; ++i) {
+                int src_q_index = (row_offset + i) * ldb_ + (col_offset + j);
+                int dst_q_index = pack_offset + j * k + i;
+                int src_s_index = src_q_index / GS;
+                int dst_s_index = dst_q_index / GS;
+                // pack q & s
+                packB->q[src_q_index] = src_q[dst_q_index];
+                packB->s[src_s_index] = src_s[dst_s_index];
+            }
+        }
     }
 
 public:
@@ -551,64 +591,84 @@ public:
     GEMM_Q0(const TA *A, int lda, 
             const TB *B, int ldb, 
             TC *C, int ldc, 
-            MicroKernelType<TA, TB, TC, RM, RN> micro_kernel) :
+            MicroKernelQ0Type<GS, TA, TB, TC, RM, RN> micro_kernel) :
             A_(A), lda_(lda), 
             B_(B), ldb_(ldb), 
             C_(C), ldc_(ldc), 
             micro_kernel_(micro_kernel) {};
 
     void multiply(int m, int n, int k) {
-        // int i, j, p;
-        int ic, jc, pc;
-        int min_m, min_k, min_n;
+        int i, j, p;
+        int ic, ib, jc, jb, pc, pb;
 
-        TA *packA; 
-        TB *packB;
-        packA = malloc_aligned<TA>(CK, CM + 1, sizeof(TA));
-        packB = malloc_aligned<TB>(CK, CN + 1, sizeof(TB));
+        TA *packed_A = malloc_aligned<TA>(CK, CM + 1, sizeof(TA));
+        TB *packed_B = malloc_aligned<TA>(CK, CN + 1, sizeof(TA));
 
         // iterate row of A
         for (ic = 0; ic < m; ic += CM) {
-            min_m = std::min(m - ic, CM);
+            ib = std::min(m - ic, CM);
 
             // col of A, row of B
             for (pc = 0; pc < k; pc += CK) {
-                min_k = std::min(k - pc, CK);
+                pb = std::min(k - pc, CK);
 
                 // n = 1, so do not need third loop of n
                 // pack matrix A
-                for (int i = 0; i < min_m; i += RM) {
+                for (int i = 0; i < ib; i += RM) {
                     PackMatrixA(
-                        std::min(min_m - i, RM), min_k, 
-                        &A_[(ic + i) * lda_ + pc], 
-                        ic, pc,
-                        packA,
-                        i * min_k
+                        std::min(ib - i, RM), pb, 
+                        A_,
+                        ic + i, pc, 
+                        packed_A,
+                        i * pb
                     );
                 }
 
                 // pack B
-                min_n = n;
-                PackMatrixB(min_k, min_n, &B_[pc * ldb_], 0, 0, packB, 0);
+                jb = n;
+                PackMatrixB(pb, jb, B_, pc, 0, packed_B, 0);
 
-                // // micro kernel
-                // for (int i = 0; i < min_m; i += RM) {
-                //     micro_kernel_(
-                //         min_k,
-                //         &packA[i * min_k],         // A block
-                //         packB,                     // B block (n=1)
-                //         &C_[(ic + i) * ldc_],        // C block
-                //         ldc_
-                //     );
-                // }
+                // micro kernel
+                for (int i = 0; i < ib; i += RM) {
+                    micro_kernel_(
+                        pb,
+                        packed_A,                  // A block
+                        i * pb,
+                        packed_B,                  // B block (n=1)
+                        0,
+                        &C_[(ic + i) * ldc_],      // C block
+                        ldc_
+                    );
+                }
             }
         }
-        free_aligned(packA);
-        free_aligned(packB);
+        free_aligned(packed_A);
+        free_aligned(packed_B);
     }
-
 };
 
+inline void matmul(float* xout, QuantizedTensorType *x, QuantizedTensorType *w, int n, int d) {
+    int m = d;
+    int k = n;
+    int nn = 1;
+    int lda = k;
+    int ldb = nn;
+    int ldc = nn;
+    const int GS = 32;
+    constexpr int RM = 4, RN = 1, CM = 72, Ck = 512, CN = 1020;
+    float *C = malloc_aligned<float>(m, nn, sizeof(float));
+    // gemm<MR, NR, MC, KC, NC>(m, nn, k, w, lda, x, ldb, C, ldc);
+
+    MicroKernelQ0Type<GS, QuantizedTensorType, QuantizedTensorType, float, RM, RN> micro_kernel;
+    micro_kernel = &AddDot_4x1_Q0<GS, QuantizedTensorType, QuantizedTensorType, float, RM, RN>;
+    GEMM_Q0<GS, QuantizedTensorType, QuantizedTensorType, float, RM, RN, CM, Ck, CN> gemm_q0(
+        w, lda, x, ldb, C, ldc, 
+        micro_kernel
+    );
+    gemm_q0.multiply(m, nn, k);
+    std::memcpy(xout, C, m * nn * sizeof(float));
+    free(C);
+}
 
 
 #endif // GEMM_HPP_
