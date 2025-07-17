@@ -16,14 +16,6 @@ using RunStateType = RunState;
 using TransformerWeightsType = TransformerWeights;
 using TransformerModelType = TransformerModel;
 
-// define struct QuantizedTensor
-struct QuantizedTensor {
-    std::vector<std::int8_t> q;   // quantized values
-    std::vector<float> s;         // scaling factors
-};
-using QuantizedTensorType = QuantizedTensor;
-
-
 // Quantization functions
 inline void quantize(QuantizedTensorType *xq, float* x, int n) {
     int num_groups = n / GS;
@@ -66,33 +58,6 @@ inline void init_quantized_tensors(std::ifstream &file, QuantizedTensorType *w, 
         w[i].s.resize(size_each / GS);
         file.read(reinterpret_cast<char*>(w[i].q.data()), size_each * sizeof(int8_t));
         file.read(reinterpret_cast<char*>(w[i].s.data()), size_each / GS * sizeof(float));
-    }
-}
-
-inline void matmul(float* xout, QuantizedTensorType *x, QuantizedTensorType *w, int n, int d) {
-    // W (d,n) @ x (n,) -> xout (d,)
-    // by far the most amount of time is spent inside this little function
-    // inputs to this function are both quantized
-
-    int i;
-    #pragma omp parallel for private(i)
-    for (i = 0; i < d; i++) {
-        float val = 0.0f;
-        int32_t ival = 0;
-        int row_index = i * n;
-
-        int group;
-        for (group = 0; group < (n + GS - 1) / GS; ++group) {
-            int begin = group * GS;
-            int end = std::min(begin + GS, n);
-            ival = 0;
-
-            for (int k = begin; k < end; ++k) {
-                ival += static_cast<int32_t>(x->q[k]) * static_cast<int32_t>(w->q[row_index + k]);
-            }
-            val += static_cast<float>(ival) * w->s[(row_index + begin) / GS] * x->s[group];
-        }
-        xout[i] = val;
     }
 }
 
