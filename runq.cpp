@@ -170,7 +170,6 @@ std::vector<float> Transformer::forward(int token, int pos) {
 
     // forward all the layers
     for(int l = 0; l < model_->config->n_layers; l++) {
-
         // attention rmsnorm
         rmsnorm(model_->state->xb.data(), model_->state->x.data(), &model_->weight->rms_att_weight[l * dim], dim);
 
@@ -178,7 +177,7 @@ std::vector<float> Transformer::forward(int token, int pos) {
         int loff = l * model_->config->seq_len * kv_dim; // kv cache layer offset for convenience
         model_->state->k = &model_->state->key_cache[loff + pos * kv_dim];
         model_->state->v = &model_->state->value_cache[loff + pos * kv_dim];
-
+        
         // qkv matmuls for this position
         quantize(model_->state->xq.data(), model_->state->xb.data(), dim);
         matmul(model_->state->q.data(), model_->state->xq.data(), &model_->weight->wq[l], dim, dim);
