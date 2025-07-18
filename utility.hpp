@@ -63,19 +63,32 @@ inline __m256 madd(__m256 a, __m256 b, __m256 c) {
 #endif
 
 #if defined(__AVX2__)
-// _mm256_maddubs_epi16：multiply 32 int8 -> 16 int16
-// _mm256_set1_epi16: initialize int16 vector with value is 1
-// _mm256_madd_epi16: 16 int16 add 2by2 -> 8 int32
-// _mm256_add_epi32: accumulate
 template<>
 inline __m256i madd(__m256i a, __m256i b, __m256i c) {
-    return _mm256_add_epi32(
-        c, 
-        _mm256_madd_epi16(
-            _mm256_maddubs_epi16(a, b), 
-            _mm256_set1_epi16(1)
-        )
-    );
+    // 1. plit 32 int8 values into two registers each containing 16 int8 values
+    __m256i a_lo = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(a, 0));
+    __m256i a_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(a, 1));
+    
+    __m256i b_lo = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(b, 0));
+    __m256i b_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(b, 1));
+    
+    // 2. 16 int16 values are multiplied to get 16 int32 values
+    __m256i prod_lo = _mm256_mullo_epi16(a_lo, b_lo);
+    __m256i prod_hi = _mm256_mullo_epi16(a_hi, b_hi);
+    
+    // 3. accumulate 16 int32 values into 8 int32 values (by adding each pair of adjacent elements)
+    __m256i sum_lo = _mm256_add_epi32(
+        _mm256_cvtepi16_epi32(_mm256_extracti128_si256(prod_lo, 0)),
+        _mm256_cvtepi16_epi32(_mm256_extracti128_si256(prod_lo, 1)));
+    
+    __m256i sum_hi = _mm256_add_epi32(
+        _mm256_cvtepi16_epi32(_mm256_extracti128_si256(prod_hi, 0)),
+        _mm256_cvtepi16_epi32(_mm256_extracti128_si256(prod_hi, 1)));
+    
+    // 4. combine the results and accumulate them into c
+    __m256i sum = _mm256_hadd_epi32(sum_lo, sum_hi);
+    return _mm256_add_epi32(c, sum);
+
 }
 #endif
 
@@ -97,8 +110,8 @@ inline float hsum(__m256 x) {
     return hsum(_mm_add_ps(hi, lo));
 }
 inline int32_t hsum(__m256i x) {
-    __m128i lo = _mm256_extracti128_si256(v, 0);
-    __m128i hi = _mm256_extracti128_si256(v, 1);
+    __m128i lo = _mm256_extracti128_si256(x, 0);
+    __m128i hi = _mm256_extracti128_si256(x, 1);
     lo = _mm_add_epi32(lo, hi);
     lo = _mm_hadd_epi32(lo, lo);
     lo = _mm_hadd_epi32(lo, lo);
@@ -107,27 +120,30 @@ inline int32_t hsum(__m256i x) {
 #endif
 
 // declaration of basic template function load
-template <typename T> 
+template <typename T, typename U> 
 T load(const float *);
+
+template <typename T, typename U> 
+T load(const std::int8_t *);
 
 #if defined(__SSE__)
 template <> 
-inline __m128 load<__m128>(const float *p) {
+inline __m128 load<__m128, float>(const float *p) {
     return _mm_loadu_ps(p);
 }
 template <>
-inline __m128i load<__m128i>(const std::int8_t *p) {
+inline __m128i load<__m128i, std::int8_t>(const std::int8_t *p) {
     return _mm_loadu_si128(reinterpret_cast<const __m128i*>(p));
 }
 #endif  // __SSE__
 
 #if defined(__AVX2__)
 template <> 
-inline __m256 load<__m256>(const float *p) {
+inline __m256 load<__m256, float>(const float *p) {
     return _mm256_loadu_ps(p);
 }
 template <>
-inline __m256i load<__m256i>(const std::int8_t *p) {
+inline __m256i load<__m256i, std::int8_t>(const std::int8_t *p) {
     return _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
 }
 #endif // __AVX__
@@ -140,7 +156,7 @@ inline T setzeros();
 template <>
 inline __m128 setzeros<__m128>() { return _mm_setzero_ps(); }
 template <>
-inline __m128i setzeros<__m128i>() { return _mm_setzero_si(); }
+inline __m128i setzeros<__m128i>() { return _mm_setzero_si128(); }
 #endif
 
 #if defined(__AVX2__)
@@ -156,16 +172,15 @@ inline T set1(float x);
 
 #if defined(__SSE__)
 template <>
-inline __m128 set1<__m128>(float x) { return _mm_set1_ps(x); }
+inline __m128 set1(float x) { return _mm_set1_ps(x); }
 #endif
 
 #if defined(__AVX2__)
 template <>
-inline __m256 set1<__m256>(float x) { return _mm256_set1_ps(x); }
-template <>
-inline __m256i set1<__m256i>(short x) { return _mm256_set1_epi16(x); }
-template <>
-inline __m256i set1<__m256i>(int x) { return _mm256_set1_epi32(x); }
+inline __m256 set1(float x) { return _mm256_set1_ps(x); }
+
+inline __m256i set1(short x) { return _mm256_set1_epi16(x); }
+inline __m256i set1(int x) { return _mm256_set1_epi32(x); }
 #endif
 
 #define MEMORY_ALIGNMENT 32
@@ -468,30 +483,30 @@ inline void AddDot_4x1(int k, TA *a, TB *b, TC *c, int ldc) {
         _mm_prefetch(reinterpret_cast<const char*>(b_p0_ptr + p + 16), _MM_HINT_T0);
 
         // load vector b 
-        b_p0_ymm0 = load<__m256>(b_p0_ptr + p + 0); 
-        b_p0_ymm1 = load<__m256>(b_p0_ptr + p + 8);
+        b_p0_ymm0 = load<__m256, float>(b_p0_ptr + p + 0); 
+        b_p0_ymm1 = load<__m256, float>(b_p0_ptr + p + 8);
 
         // load matrix a_0p and compute c00 = a_0p * b_p0
-        a_0p_ymm0 = load<__m256>(a_0p_ptr + p + 0); 
-        a_0p_ymm1 = load<__m256>(a_0p_ptr + p + 8);
+        a_0p_ymm0 = load<__m256, float>(a_0p_ptr + p + 0); 
+        a_0p_ymm1 = load<__m256, float>(a_0p_ptr + p + 8);
         c_00_ymm0 = madd(a_0p_ymm0, b_p0_ymm0, c_00_ymm0);
         c_00_ymm1 = madd(a_0p_ymm1, b_p0_ymm1, c_00_ymm1);
 
         // load matrix a_1p and compute c10 = a_1p * b_p0
-        a_1p_ymm0 = load<__m256>(a_1p_ptr + p + 0); 
-        a_1p_ymm1 = load<__m256>(a_1p_ptr + p + 8);
+        a_1p_ymm0 = load<__m256, float>(a_1p_ptr + p + 0); 
+        a_1p_ymm1 = load<__m256, float>(a_1p_ptr + p + 8);
         c_10_ymm0 = madd(a_1p_ymm0, b_p0_ymm0, c_10_ymm0); 
         c_10_ymm1 = madd(a_1p_ymm1, b_p0_ymm1, c_10_ymm1);
 
         // load matrix a_2p and compute c20 = a_2p * b_p0
-        a_2p_ymm0 = load<__m256>(a_2p_ptr + p + 0); 
-        a_2p_ymm1 = load<__m256>(a_2p_ptr + p + 8);
+        a_2p_ymm0 = load<__m256, float>(a_2p_ptr + p + 0); 
+        a_2p_ymm1 = load<__m256, float>(a_2p_ptr + p + 8);
         c_20_ymm0 = madd(a_2p_ymm0, b_p0_ymm0, c_20_ymm0); 
         c_20_ymm1 = madd(a_2p_ymm1, b_p0_ymm1, c_20_ymm1);
 
         // load matrix a_3p and compute c30 = a_3p * b_p0
-        a_3p_ymm0 = load<__m256>(a_3p_ptr + p + 0); 
-        a_3p_ymm1 = load<__m256>(a_3p_ptr + p + 8);
+        a_3p_ymm0 = load<__m256, float>(a_3p_ptr + p + 0); 
+        a_3p_ymm1 = load<__m256, float>(a_3p_ptr + p + 8);
         c_30_ymm0 = madd(a_3p_ymm0, b_p0_ymm0, c_30_ymm0); 
         c_30_ymm1 = madd(a_3p_ymm1, b_p0_ymm1, c_30_ymm1);
     }
@@ -518,12 +533,11 @@ inline void AddDot_4x1(int k, TA *a, TB *b, TC *c, int ldc) {
 
         int r = 0;
         for (; r + 3 < remainder; r += 4) {
-            b_p0_xmm = _mm_loadu_ps(b_p0_ptr + p + r);
-            // c_00_xmm = 
-            a_0p_xmm = load<__m128>(a_0p_ptr + p + r);
-            a_1p_xmm = load<__m128>(a_1p_ptr + p + r);
-            a_2p_xmm = load<__m128>(a_2p_ptr + p + r);
-            a_3p_xmm = load<__m128>(a_3p_ptr + p + r);
+            b_p0_xmm = load<__m128, float>(b_p0_ptr + p + r);
+            a_0p_xmm = load<__m128, float>(a_0p_ptr + p + r);
+            a_1p_xmm = load<__m128, float>(a_1p_ptr + p + r);
+            a_2p_xmm = load<__m128, float>(a_2p_ptr + p + r);
+            a_3p_xmm = load<__m128, float>(a_3p_ptr + p + r);
 
             // compute c += a * b
             c_00_xmm = add(c_00_xmm, mul(a_0p_xmm, b_p0_xmm));
@@ -694,23 +708,61 @@ inline void AddDot_4x1_Q0(int k, const TA *a, int offset_A, const TB *b, int off
     c_20_reg = 0.0;
     c_30_reg = 0.0;
 
+    __m256i a_0p_ymm0 = setzeros<__m256i>();
+    __m256i a_1p_ymm0 = setzeros<__m256i>();
+    __m256i a_2p_ymm0 = setzeros<__m256i>();
+    __m256i a_3p_ymm0 = setzeros<__m256i>();
+    __m256i b_p0_ymm0 = setzeros<__m256i>();
+
     int group;
     for (group = 0; group < (k + GS - 1) / GS; ++group) {
         int begin = group * GS;
         int end = std::min(begin + GS, k);
 
-        int32_t acc_00 = 0, acc_10 = 0, acc_20 = 0, acc_30 = 0;
-        for (int p = begin; p <end; ++p) {
+        __m256i acc_00 = setzeros<__m256i>();
+        __m256i acc_10 = setzeros<__m256i>();
+        __m256i acc_20 = setzeros<__m256i>();
+        __m256i acc_30 = setzeros<__m256i>();
+
+        int p = begin;
+        for (; p + 31 < end; p += 32) {
+            _mm_prefetch(reinterpret_cast<const char*>(&a->q[offset_A + 0 * k + p + 32]), _MM_HINT_T0);
+            _mm_prefetch(reinterpret_cast<const char*>(&b->q[offset_B + p + 32]), _MM_HINT_T0);
+
             int a_index_0p = offset_A + 0 * k + p;
             int a_index_1p = offset_A + 1 * k + p;
             int a_index_2p = offset_A + 2 * k + p;
             int a_index_3p = offset_A + 3 * k + p;
             int b_index_p0 = offset_B + p;
 
-            acc_00 += static_cast<int32_t>(a->q[a_index_0p]) * static_cast<int32_t>(b->q[b_index_p0]);
-            acc_10 += static_cast<int32_t>(a->q[a_index_1p]) * static_cast<int32_t>(b->q[b_index_p0]);
-            acc_20 += static_cast<int32_t>(a->q[a_index_2p]) * static_cast<int32_t>(b->q[b_index_p0]);
-            acc_30 += static_cast<int32_t>(a->q[a_index_3p]) * static_cast<int32_t>(b->q[b_index_p0]);
+            a_0p_ymm0 = load<__m256i, std::int8_t>(&a->q[a_index_0p]);
+            a_1p_ymm0 = load<__m256i, std::int8_t>(&a->q[a_index_1p]);
+            a_2p_ymm0 = load<__m256i, std::int8_t>(&a->q[a_index_2p]);
+            a_3p_ymm0 = load<__m256i, std::int8_t>(&a->q[a_index_3p]);
+            b_p0_ymm0 = load<__m256i, std::int8_t>(&b->q[b_index_p0]);
+
+            acc_00 = madd(a_0p_ymm0, b_p0_ymm0, acc_00);
+            acc_10 = madd(a_1p_ymm0, b_p0_ymm0, acc_10);
+            acc_20 = madd(a_2p_ymm0, b_p0_ymm0, acc_20);
+            acc_30 = madd(a_3p_ymm0, b_p0_ymm0, acc_30);
+        }
+
+        int32_t acc_00_sum = hsum(acc_00);
+        int32_t acc_10_sum = hsum(acc_10);
+        int32_t acc_20_sum = hsum(acc_20);
+        int32_t acc_30_sum = hsum(acc_30);
+
+        for (; p < end; ++p) {
+            int a_index_0p = offset_A + 0 * k + p;
+            int a_index_1p = offset_A + 1 * k + p;
+            int a_index_2p = offset_A + 2 * k + p;
+            int a_index_3p = offset_A + 3 * k + p;
+            int b_index_p0 = offset_B + p;
+
+            acc_00_sum += static_cast<int32_t>(a->q[a_index_0p]) * static_cast<int32_t>(b->q[b_index_p0]);
+            acc_10_sum += static_cast<int32_t>(a->q[a_index_1p]) * static_cast<int32_t>(b->q[b_index_p0]);
+            acc_20_sum += static_cast<int32_t>(a->q[a_index_2p]) * static_cast<int32_t>(b->q[b_index_p0]);
+            acc_30_sum += static_cast<int32_t>(a->q[a_index_3p]) * static_cast<int32_t>(b->q[b_index_p0]);
         }
 
         float a_s0 = a->s[(offset_A + 0 * k + begin) / GS];
@@ -719,10 +771,10 @@ inline void AddDot_4x1_Q0(int k, const TA *a, int offset_A, const TB *b, int off
         float a_s3 = a->s[(offset_A + 3 * k + begin) / GS];
         float b_s = b->s[(offset_B + begin) / GS];
 
-        c_00_reg += static_cast<TC>(acc_00) * a_s0 * b_s;
-        c_10_reg += static_cast<TC>(acc_10) * a_s1 * b_s;
-        c_20_reg += static_cast<TC>(acc_20) * a_s2 * b_s;
-        c_30_reg += static_cast<TC>(acc_30) * a_s3 * b_s;
+        c_00_reg += static_cast<TC>(acc_00_sum) * a_s0 * b_s;
+        c_10_reg += static_cast<TC>(acc_10_sum) * a_s1 * b_s;
+        c_20_reg += static_cast<TC>(acc_20_sum) * a_s2 * b_s;
+        c_30_reg += static_cast<TC>(acc_30_sum) * a_s3 * b_s;
     }
 
     c[0 * ldc + 0] += c_00_reg;
@@ -730,6 +782,7 @@ inline void AddDot_4x1_Q0(int k, const TA *a, int offset_A, const TB *b, int off
     c[2 * ldc + 0] += c_20_reg;
     c[3 * ldc + 0] += c_30_reg;
 }
+
 
 template <int GS, typename TA, typename TB, typename TC, int RM, int RN>
 using MicroKernelQ0Type = void (*)(int, const TA*, int, const TB*, int, TC*, int);
