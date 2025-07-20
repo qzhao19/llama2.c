@@ -68,7 +68,6 @@ inline __m256i madd(__m256i a, __m256i b, __m256i c) {
     // 1. plit 32 int8 values into two registers each containing 16 int8 values
     __m256i a_lo = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(a, 0));
     __m256i a_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(a, 1));
-    
     __m256i b_lo = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(b, 0));
     __m256i b_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(b, 1));
     
@@ -88,7 +87,6 @@ inline __m256i madd(__m256i a, __m256i b, __m256i c) {
     // 4. combine the results and accumulate them into c
     __m256i sum = _mm256_hadd_epi32(sum_lo, sum_hi);
     return _mm256_add_epi32(c, sum);
-
 }
 #endif
 
@@ -131,6 +129,7 @@ template <>
 inline __m128 load<__m128, float>(const float *p) {
     return _mm_loadu_ps(p);
 }
+
 template <>
 inline __m128i load<__m128i, std::int8_t>(const std::int8_t *p) {
     return _mm_loadu_si128(reinterpret_cast<const __m128i*>(p));
@@ -178,9 +177,22 @@ inline __m128 set1(float x) { return _mm_set1_ps(x); }
 #if defined(__AVX2__)
 template <>
 inline __m256 set1(float x) { return _mm256_set1_ps(x); }
-
 inline __m256i set1(short x) { return _mm256_set1_epi16(x); }
 inline __m256i set1(int x) { return _mm256_set1_epi32(x); }
+#endif
+
+#if defined(__AVX2__)
+inline void store(std::int8_t *a, __m256i b) {
+    // _mm256_storeu_si256(a, b);
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(a), b);
+}
+#endif
+
+#if defined(__SSE__)
+inline void store(std::int8_t *a, __m128i b) {
+    // _mm_storeu_si128(a, b);
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(a), b);
+}
 #endif
 
 #define MEMORY_ALIGNMENT 32
@@ -634,6 +646,7 @@ public:
         int ic, ib, jc, jb, pc, pb;
 
         // iterate row of A
+        #pragma omp parallel for private(ic, ib, pc, pb, i) schedule(dynamic)
         for (ic = 0; ic < m; ic += CM) {
             ib = std::min(m - ic, CM);
 
@@ -677,6 +690,18 @@ public:
     }
 };
 
+inline void matmul_pseudo(float* xout, float* x, float* w, int n, int d) {
+    int i;
+    #pragma omp parallel for private(i)
+    for (i = 0; i < d; i++) {
+        float val = 0.0f;
+        for (int j = 0; j < n; j++) {
+            val += w[i * n + j] * x[j];
+        }
+        xout[i] = val;
+    }
+};
+
 inline void matmul(float* xout, float* x, float* w, int n, int d) {
     int m = d;
     int k = n;
@@ -702,87 +727,98 @@ inline void matmul(float* xout, float* x, float* w, int n, int d) {
 
 template <int GS, typename TA, typename TB, typename TC, int RM = 4, int RN = 1>
 inline void AddDot_4x1_Q0(int k, const TA *a, int offset_A, const TB *b, int offset_B, TC *c, int ldc) {
-    TC c_00_reg, c_10_reg, c_20_reg, c_30_reg;
-    c_00_reg = 0.0;
-    c_10_reg = 0.0;
-    c_20_reg = 0.0;
-    c_30_reg = 0.0;
-
-    __m256i a_0p_ymm0 = setzeros<__m256i>();
-    __m256i a_1p_ymm0 = setzeros<__m256i>();
-    __m256i a_2p_ymm0 = setzeros<__m256i>();
-    __m256i a_3p_ymm0 = setzeros<__m256i>();
-    __m256i b_p0_ymm0 = setzeros<__m256i>();
-
-    int group;
-    for (group = 0; group < (k + GS - 1) / GS; ++group) {
-        int begin = group * GS;
-        int end = std::min(begin + GS, k);
-
-        __m256i acc_00 = setzeros<__m256i>();
-        __m256i acc_10 = setzeros<__m256i>();
-        __m256i acc_20 = setzeros<__m256i>();
-        __m256i acc_30 = setzeros<__m256i>();
-
+    // 初始化累加器
+    TC c_00_reg = 0.0, c_10_reg = 0.0, c_20_reg = 0.0, c_30_reg = 0.0;
+    
+    const int a_0p_ptr = offset_A + 0 * k;
+    const int a_1p_ptr = offset_A + 1 * k;
+    const int a_2p_ptr = offset_A + 2 * k;
+    const int a_3p_ptr = offset_A + 3 * k;
+    const auto& a_q = a->q;
+    const auto& b_q = b->q;
+    for (int group = 0; group < (k + GS - 1) / GS; ++group) {
+        const int begin = group * GS;
+        const int end = std::min(begin + GS, k);
+        
+        _mm_prefetch(reinterpret_cast<const char*>(&a->s[(a_0p_ptr + begin) / GS]), _MM_HINT_T0);
+        _mm_prefetch(reinterpret_cast<const char*>(&b->s[(offset_B + begin) / GS]), _MM_HINT_T0);
+        
+        // 32-byte aligned accumulators
+        alignas(32) int32_t acc_00_sum = 0;
+        alignas(32) int32_t acc_10_sum = 0;
+        alignas(32) int32_t acc_20_sum = 0;
+        alignas(32) int32_t acc_30_sum = 0;
+        
         int p = begin;
-        for (; p + 31 < end; p += 32) {
-            _mm_prefetch(reinterpret_cast<const char*>(&a->q[offset_A + 0 * k + p + 32]), _MM_HINT_T0);
-            _mm_prefetch(reinterpret_cast<const char*>(&b->q[offset_B + p + 32]), _MM_HINT_T0);
-
-            int a_index_0p = offset_A + 0 * k + p;
-            int a_index_1p = offset_A + 1 * k + p;
-            int a_index_2p = offset_A + 2 * k + p;
-            int a_index_3p = offset_A + 3 * k + p;
-            int b_index_p0 = offset_B + p;
-
-            a_0p_ymm0 = load<__m256i, std::int8_t>(&a->q[a_index_0p]);
-            a_1p_ymm0 = load<__m256i, std::int8_t>(&a->q[a_index_1p]);
-            a_2p_ymm0 = load<__m256i, std::int8_t>(&a->q[a_index_2p]);
-            a_3p_ymm0 = load<__m256i, std::int8_t>(&a->q[a_index_3p]);
-            b_p0_ymm0 = load<__m256i, std::int8_t>(&b->q[b_index_p0]);
-
-            acc_00 = madd(a_0p_ymm0, b_p0_ymm0, acc_00);
-            acc_10 = madd(a_1p_ymm0, b_p0_ymm0, acc_10);
-            acc_20 = madd(a_2p_ymm0, b_p0_ymm0, acc_20);
-            acc_30 = madd(a_3p_ymm0, b_p0_ymm0, acc_30);
+        if (end - begin >= 32) {
+            __m256i acc_00_ymm = setzeros<__m256i>();
+            __m256i acc_10_ymm = setzeros<__m256i>();
+            __m256i acc_20_ymm = setzeros<__m256i>();
+            __m256i acc_30_ymm = setzeros<__m256i>();
+            
+            for (; p + 31 < end; p += 32) {
+                _mm_prefetch(reinterpret_cast<const char*>(&a_q[a_0p_ptr + p + 64]), _MM_HINT_T0);
+                _mm_prefetch(reinterpret_cast<const char*>(&a_q[a_1p_ptr + p + 64]), _MM_HINT_T0);
+                _mm_prefetch(reinterpret_cast<const char*>(&a_q[a_2p_ptr + p + 64]), _MM_HINT_T0);
+                _mm_prefetch(reinterpret_cast<const char*>(&a_q[a_3p_ptr + p + 64]), _MM_HINT_T0);
+                _mm_prefetch(reinterpret_cast<const char*>(&b_q[offset_B + p + 64]), _MM_HINT_T0);
+                
+                __m256i a_0p_ymm = load<__m256i, std::int8_t>(&a_q[a_0p_ptr + p]);
+                __m256i a_1p_ymm = load<__m256i, std::int8_t>(&a_q[a_1p_ptr + p]);
+                __m256i a_2p_ymm = load<__m256i, std::int8_t>(&a_q[a_2p_ptr + p]);
+                __m256i a_3p_ymm = load<__m256i, std::int8_t>(&a_q[a_3p_ptr + p]);
+                __m256i b_p0_ymm = load<__m256i, std::int8_t>(&b_q[offset_B + p]);
+                
+                acc_00_ymm = madd(a_0p_ymm, b_p0_ymm, acc_00_ymm);
+                acc_10_ymm = madd(a_1p_ymm, b_p0_ymm, acc_10_ymm);
+                acc_20_ymm = madd(a_2p_ymm, b_p0_ymm, acc_20_ymm);
+                acc_30_ymm = madd(a_3p_ymm, b_p0_ymm, acc_30_ymm);
+            }
+            acc_00_sum = hsum(acc_00_ymm);
+            acc_10_sum = hsum(acc_10_ymm);
+            acc_20_sum = hsum(acc_20_ymm);
+            acc_30_sum = hsum(acc_30_ymm);
         }
-
-        int32_t acc_00_sum = hsum(acc_00);
-        int32_t acc_10_sum = hsum(acc_10);
-        int32_t acc_20_sum = hsum(acc_20);
-        int32_t acc_30_sum = hsum(acc_30);
-
+        
+        if (end - p >= 4) {
+            for (; p + 3 < end; p += 4) {
+                for (int j = 0; j < 4; ++j) {
+                    int index = p + j;
+                    int8_t b_val = b_q[offset_B + index];
+                    acc_00_sum += static_cast<int32_t>(a_q[a_0p_ptr + index]) * static_cast<int32_t>(b_val);
+                    acc_10_sum += static_cast<int32_t>(a_q[a_1p_ptr + index]) * static_cast<int32_t>(b_val);
+                    acc_20_sum += static_cast<int32_t>(a_q[a_2p_ptr + index]) * static_cast<int32_t>(b_val);
+                    acc_30_sum += static_cast<int32_t>(a_q[a_3p_ptr + index]) * static_cast<int32_t>(b_val);
+                }
+            }
+        }
+        
         for (; p < end; ++p) {
-            int a_index_0p = offset_A + 0 * k + p;
-            int a_index_1p = offset_A + 1 * k + p;
-            int a_index_2p = offset_A + 2 * k + p;
-            int a_index_3p = offset_A + 3 * k + p;
-            int b_index_p0 = offset_B + p;
-
-            acc_00_sum += static_cast<int32_t>(a->q[a_index_0p]) * static_cast<int32_t>(b->q[b_index_p0]);
-            acc_10_sum += static_cast<int32_t>(a->q[a_index_1p]) * static_cast<int32_t>(b->q[b_index_p0]);
-            acc_20_sum += static_cast<int32_t>(a->q[a_index_2p]) * static_cast<int32_t>(b->q[b_index_p0]);
-            acc_30_sum += static_cast<int32_t>(a->q[a_index_3p]) * static_cast<int32_t>(b->q[b_index_p0]);
+            int8_t b_val = b_q[offset_B + p];
+            acc_00_sum += static_cast<int32_t>(a_q[a_0p_ptr + p]) * static_cast<int32_t>(b_val);
+            acc_10_sum += static_cast<int32_t>(a_q[a_1p_ptr + p]) * static_cast<int32_t>(b_val);
+            acc_20_sum += static_cast<int32_t>(a_q[a_2p_ptr + p]) * static_cast<int32_t>(b_val);
+            acc_30_sum += static_cast<int32_t>(a_q[a_3p_ptr + p]) * static_cast<int32_t>(b_val);
         }
-
-        float a_s0 = a->s[(offset_A + 0 * k + begin) / GS];
-        float a_s1 = a->s[(offset_A + 1 * k + begin) / GS];
-        float a_s2 = a->s[(offset_A + 2 * k + begin) / GS];
-        float a_s3 = a->s[(offset_A + 3 * k + begin) / GS];
-        float b_s = b->s[(offset_B + begin) / GS];
-
-        c_00_reg += static_cast<TC>(acc_00_sum) * a_s0 * b_s;
-        c_10_reg += static_cast<TC>(acc_10_sum) * a_s1 * b_s;
-        c_20_reg += static_cast<TC>(acc_20_sum) * a_s2 * b_s;
-        c_30_reg += static_cast<TC>(acc_30_sum) * a_s3 * b_s;
+        
+        const float a_s0 = a->s[(a_0p_ptr + begin) / GS];
+        const float a_s1 = a->s[(a_1p_ptr + begin) / GS];
+        const float a_s2 = a->s[(a_2p_ptr + begin) / GS];
+        const float a_s3 = a->s[(a_3p_ptr + begin) / GS];
+        const float b_s = b->s[(offset_B + begin) / GS];
+        
+        const float combined_scale = b_s;
+        c_00_reg += acc_00_sum * a_s0 * combined_scale;
+        c_10_reg += acc_10_sum * a_s1 * combined_scale;
+        c_20_reg += acc_20_sum * a_s2 * combined_scale;
+        c_30_reg += acc_30_sum * a_s3 * combined_scale;
     }
-
+    
     c[0 * ldc + 0] += c_00_reg;
     c[1 * ldc + 0] += c_10_reg;
     c[2 * ldc + 0] += c_20_reg;
     c[3 * ldc + 0] += c_30_reg;
 }
-
 
 template <int GS, typename TA, typename TB, typename TC, int RM, int RN>
 using MicroKernelQ0Type = void (*)(int, const TA*, int, const TB*, int, TC*, int);
@@ -795,67 +831,89 @@ private:
     const TA *const A_;
     const TB *const B_;
     TC *const C_;
-
     const int lda_;
     const int ldb_;
     const int ldc_;
-
     MicroKernelQ0Type<GS, TA, TB, TC, RM, RN> micro_kernel_;
-
-    // packing matrix A following row-major order
-    void PackMatrixA(int m, int k, const TA *A, int row_offset, int col_offset, TA *packA, int pack_offset) {
+    
+    void PackMatrixA(int m, int k, const TA *A, int row_offset, int col_offset, 
+                TA *packA, int pack_offset) {
         const auto &src_q = A->q;
         const auto &src_s = A->s;
         
         using QType = typename decltype(A->q)::value_type;
         const QType *src_q_row[RM];
         
-        int i, p;
-        for (i = 0; i < RM; ++i) {
+        for (int i = 0; i < RM; ++i) {
             if (i < m) {
                 src_q_row[i] = &src_q[(row_offset + i) * lda_ + col_offset];
-            }
-            else {
+            } else {
                 src_q_row[i] = &src_q[(row_offset + 0) * lda_ + col_offset];
             }
         }
-
-        for (i = 0; i < RM; ++i) {
-            const QType *current_q_row_index = src_q_row[i];
+        
+        for (int i = 0; i < RM; ++i) {
+            const QType *current_q_row = src_q_row[i];
             const int abs_row_index = row_offset + (i < m ? i : 0);
-            for (p = 0; p < k; ++p) {
-                int dst_q_index = pack_offset + i * k + p;
-                int dst_s_index = dst_q_index / GS;
+            int dst_q_base = pack_offset + i * k;
+            int p = 0;
+            for (; p + 31 < k; p += 32) {
+                __m256i data = load<__m256i, std::int8_t>(current_q_row + p);
+                store(&packA->q[dst_q_base + p], data);
+                for (int j = p; j < p + 32 && j < k; j += GS) {
+                    int dst_s_index = (dst_q_base + j) / GS;
+                    int src_s_index = (abs_row_index * lda_ + col_offset + j) / GS;
+                    packA->s[dst_s_index] = src_s[src_s_index];
+                }
+            }
+            
+            for (; p < k; ++p) {
+                int dst_q_index = dst_q_base + p;
                 int src_q_index = abs_row_index * lda_ + col_offset + p;
-                int src_s_index = src_q_index / GS;
-
-                // packing q & s
-                packA->q[dst_q_index] = current_q_row_index[p];
-                packA->s[dst_s_index] = src_s[src_s_index];
+                packA->q[dst_q_index] = current_q_row[p];
+                
+                if (p % GS == 0) {
+                    int dst_s_index = dst_q_index / GS;
+                    int src_s_index = src_q_index / GS;
+                    packA->s[dst_s_index] = src_s[src_s_index];
+                }
             }
         }
     }
 
-    void PackMatrixB(int k, int n, const TB *B, int row_offset, int col_offset, TB *packB, int pack_offset) {
+    void PackMatrixB(int k, int n, const TB *B, int row_offset, int col_offset, 
+                TB *packB, int pack_offset) {
         const auto &src_q = B->q;
         const auto &src_s = B->s;
+        
+        int i = 0;
+        for (; i + 31 < k; i += 32) {
+            int src_base = (row_offset + i) * ldb_ + col_offset;
+            int dst_base = pack_offset + i;
+            __m256i data = load<__m256i, std::int8_t>(&src_q[src_base]);
+            store(&packB->q[dst_base], data);
 
-        int i, j;
-        for (j = 0; j < n; ++j) {
-            for (i = 0; i < k; ++i) {
-                int src_q_index = (row_offset + i) * ldb_ + (col_offset + j);
-                int dst_q_index = pack_offset + j * k + i;
+            for (int j = 0; j < 32 && i + j < k; j += GS) {
+                int src_s_index = (src_base + j) / GS;
+                int dst_s_index = (dst_base + j) / GS;
+                packB->s[dst_s_index] = src_s[src_s_index];
+            }
+        }
+        
+        for (; i < k; ++i) {
+            int src_q_index = (row_offset + i) * ldb_ + col_offset;
+            int dst_q_index = pack_offset + i;
+            packB->q[dst_q_index] = src_q[src_q_index];
+
+            if (i % GS == 0) {
                 int src_s_index = src_q_index / GS;
                 int dst_s_index = dst_q_index / GS;
-                // pack q & s
-                packB->q[dst_q_index] = src_q[src_q_index];
                 packB->s[dst_s_index] = src_s[src_s_index];
             }
         }
     }
 
 public:
-
     GEMM_Q0(const TA *A, int lda, 
             const TB *B, int ldb, 
             TC *C, int ldc, 
@@ -864,22 +922,19 @@ public:
             B_(B), ldb_(ldb), 
             C_(C), ldc_(ldc), 
             micro_kernel_(micro_kernel) {};
-
     void multiply(int m, int n, int k) {
         int i, j, p;
         int ic, ib, jc, jb, pc, pb;
 
         // iterate row of A
+        #pragma omp parallel for private(ic, ib, pc, pb, i)
         for (ic = 0; ic < m; ic += CM) {
             ib = std::min(m - ic, CM);
-
             // col of A, row of B
             for (pc = 0; pc < k; pc += CK) {
                 pb = std::min(k - pc, CK);
-
                 TA *packed_A = malloc_aligned<TA>(ib * pb, 1, sizeof(TA));
                 TB *packed_B = malloc_aligned<TB>(pb * n, 1, sizeof(TB));
-
                 // n = 1, so do not need third loop of n
                 // pack matrix A
                 for (int i = 0; i < ib; i += RM) {
@@ -891,11 +946,9 @@ public:
                         i * pb
                     );
                 }
-
                 // pack B
                 jb = n;
                 PackMatrixB(pb, jb, B_, pc, 0, packed_B, 0);
-
                 // micro kernel
                 for (int i = 0; i < ib; i += RM) {
                     micro_kernel_(
@@ -915,18 +968,48 @@ public:
     }
 };
 
+inline void matmul_pseudo(float* xout, const QuantizedTensorType *x, const QuantizedTensorType *w, int n, int d) {
+    int i;
+    int GS = 32;
+    #pragma omp parallel for private(i)
+    for (i = 0; i < d; i++) {
+        float val = 0.0f;
+        int32_t ival = 0;
+        int row_index = i * n;
+        int group;
+        for (group = 0; group < (n + GS - 1) / GS; ++group) {
+            int begin = group * GS;
+            int end = std::min(begin + GS, n);
+            ival = 0;
+            for (int k = begin; k < end; ++k) {
+                ival += static_cast<int32_t>(x->q[k]) * static_cast<int32_t>(w->q[row_index + k]);
+            }
+            val += ((float) ival) * w->s[(row_index + begin) / GS] * x->s[group];
+            
+        }
+        xout[i] = val;
+    }
+}
+
+
 // W (d,n) @ x (n,) -> xout (d,)
 // by far the most amount of time is spent inside this little function
 // inputs to this function are both quantized
 inline void matmul(float* xout, const QuantizedTensorType *x, const QuantizedTensorType *w, int n, int d) {
+    const int GS = 32;
+    const int SMALL_MATRIX_THRESHOLD = 768 * 768;
+    if (n * d <= SMALL_MATRIX_THRESHOLD) {
+        matmul_pseudo(xout, x, w, n, d);
+        return ;
+    }
+
     int m = d;
     int k = n;
     int nn = 1;
     int lda = k;
     int ldb = nn;
     int ldc = nn;
-    const int GS = 32;
-    constexpr int RM = 4, RN = 1, CM = 72, Ck = 256, CN = 1020;
+    constexpr int RM = 4, RN = 1, CM = 32, Ck = 128, CN = 1020;
     float *C = malloc_aligned<float>(m, nn, sizeof(float));
 
     MicroKernelQ0Type<GS, QuantizedTensorType, QuantizedTensorType, float, RM, RN> micro_kernel;
