@@ -1,3 +1,62 @@
+## Overview
+
+This project is a C++ reimplementation derived from the original llama2.c project. While maintaining the simplicity and educational value of the original implementation, We have enhanced the codebase with modern C++ features and performance optimization technologies. While retaining core functionalities, we have implemented a series of performance optimizations to improve model inference efficiency.
+
+##### Key Features
+
+- **C++ Rewrite**: Complete reimplementation of the original C code using modern C++ (C++17)
+- **Optimized GEMM**: Custom General Matrix Multiply (GEMM) implementation optimized for both quantized and non-quantized models
+- **Dual Model Support**:
+  - **`run.cpp/.hpp`**: Handles standard float models
+  - **`runq.cpp/.hpp`**: Specialized for int8 quantized models with Q8_0 quantization
+
+##### Performance Improvement
+
+Our implementation provides performance gains over the original version through:
+
+- **Vectorization**: SIMD instructions (SSE/AVX2) accelerate matrix multiplication by processing multiple elements simultaneously
+
+- **Memory Optimization**: Efficient memory layout, prefetching strategies, and matrix blocking techniques
+
+##### Testing Environment
+
+- **CPU**: 12th Gen Intel(R) Core(TM) i7-12700
+- **Cores**: 6
+- **Memory**: 8GB
+- **Environment**: Native Linux running on WSL2 platform
+
+The following benchmarks demonstrate the performance achieved with our optimized GEMM algorithm:
+
+| model | weights data type | tok/sec (optimized) | tok/sec (pseudo)| 
+|---------|-----------------|-------------------|-------------------|
+| stories15M      | float   |         224       |        153        |
+| stories15M-q80  | q8_0    |         287       |        338        |
+
+It's important to note that our optimized GEMM algorithm did not achieve significant performance improvements for these small-scale models. Particularly for the quantized version, we actually observed a performance decrease. We believe this is because the overhead of SIMD instructions and matrix blocking techniques outweighs the benefits for small matrix operations. We plan to continue testing on larger parameter-scale models where these optimizations are expected to provide more substantial benefits.
+
+
+##### Build & Usage
+
+CMake-based build system with configurable options:
+
+- **`USE_SSE=ON`**: Enable SSE instruction set
+- **`USE_AVX=ON`**: Enable AVX2 instruction set
+- **`USE_OPENMP=OFF`**: Enable multi-threading support
+
+```shell
+mkdir build && cd build
+cmake ..
+make
+```
+
+The implementation maintains API compatibility with the original `llama2.c` while offering enhanced performance:
+
+```shell
+./run model.bin -i "I believe the meaning of life is"
+./runq model.bin -i "I believe the meaning of life is"
+```
+
+
 ## llama2.c
 
 <p align="center">
