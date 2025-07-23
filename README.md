@@ -32,11 +32,9 @@ The following benchmarks demonstrate the performance achieved with our optimized
 | stories15M      | float   |         290       |        153        |
 | stories42M      | float   |         107       |        45         |
 | stories110M     | float   |         41        |        17         |
-| stories15M-q80  | q8_0    |         287       |        338        |
-
+| stories15M-q80  | q8_0    |         345       |        373        |
 
 It's important to note that our optimized GEMM algorithm did not achieve significant performance improvements for these small-scale models. Particularly for the quantized version, we actually observed a performance decrease. We believe this is because the overhead of SIMD instructions and matrix blocking techniques outweighs the benefits for small matrix operations. We plan to continue testing on larger parameter-scale models where these optimizations are expected to provide more substantial benefits.
-
 
 ##### Build & Usage
 
