@@ -108,12 +108,16 @@ inline float hsum(__m256 x) {
     return hsum(_mm_add_ps(hi, lo));
 }
 inline int32_t hsum(__m256i x) {
-    __m128i lo = _mm256_extracti128_si256(x, 0);
-    __m128i hi = _mm256_extracti128_si256(x, 1);
-    lo = _mm_add_epi32(lo, hi);
-    lo = _mm_hadd_epi32(lo, lo);
-    lo = _mm_hadd_epi32(lo, lo);
-    return _mm_extract_epi32(lo, 0);
+    // Reduce two horizontal operations to one
+    __m128i sum_lo = _mm256_extracti128_si256(x, 0);
+    __m128i sum_hi = _mm256_extracti128_si256(x, 1);
+    __m128i sum = _mm_add_epi32(sum_lo, sum_hi);
+    
+    // Single horizontal add with shuffling
+    sum = _mm_add_epi32(sum, _mm_shuffle_epi32(sum, 0x4E)); // 0x4E = 01001110
+    sum = _mm_add_epi32(sum, _mm_shuffle_epi32(sum, 0xB1)); // 0xB1 = 10110001
+    
+    return _mm_cvtsi128_si32(sum);
 }
 #endif
 
@@ -553,257 +557,106 @@ inline void matmul_pseudo(float* xout, float* x, float* w, int n, int d) {
 };
 
 inline void matmul(float* xout, float* x, float* w, int n, int d) {
-    int m = d;
-    int lda = n;
     constexpr int RM = 4, RN = 1, CM = 72, CN = 256;
-    float *C = malloc_aligned<float>(m, 1, sizeof(float));
+    std::memset(xout, 0, d * sizeof(float));
     GEMV<float, float, float, RM, RN, CM, CN> gemv(
-        w, lda, x, C
+        w, n, x, xout
     );
-    gemv.multiply(m, n);
-    std::memcpy(xout, C, m * sizeof(float));
-    free(C);
+    gemv.multiply(d, n);
 }
 
 // ----------------------------------------------------------------------------
 
-template <int GS, typename TA, typename TB, typename TC, int RM = 4, int RN = 1>
-inline void AddDot_4x1_Q0(int k, const TA *a, int offset_A, const TB *b, int offset_B, TC *c, int ldc) {
-    TC c_00_reg = 0.0, c_10_reg = 0.0, c_20_reg = 0.0, c_30_reg = 0.0;
-    
-    const int a_0p_ptr = offset_A + 0 * k;
-    const int a_1p_ptr = offset_A + 1 * k;
-    const int a_2p_ptr = offset_A + 2 * k;
-    const int a_3p_ptr = offset_A + 3 * k;
-    const auto& a_q = a->q;
-    const auto& b_q = b->q;
-    for (int group = 0; group < (k + GS - 1) / GS; ++group) {
-        const int begin = group * GS;
-        const int end = std::min(begin + GS, k);
-        
-        _mm_prefetch(reinterpret_cast<const char*>(&a->s[(a_0p_ptr + begin) / GS]), _MM_HINT_T0);
-        _mm_prefetch(reinterpret_cast<const char*>(&b->s[(offset_B + begin) / GS]), _MM_HINT_T0);
-        
-        // 32-byte aligned accumulators
-        alignas(32) int32_t acc_00_sum = 0;
-        alignas(32) int32_t acc_10_sum = 0;
-        alignas(32) int32_t acc_20_sum = 0;
-        alignas(32) int32_t acc_30_sum = 0;
-        
-        int p = begin;
-        if (end - begin >= 32) {
-            __m256i acc_00_ymm = setzeros<__m256i>();
-            __m256i acc_10_ymm = setzeros<__m256i>();
-            __m256i acc_20_ymm = setzeros<__m256i>();
-            __m256i acc_30_ymm = setzeros<__m256i>();
-            
-            for (; p + 31 < end; p += 32) {
-                _mm_prefetch(reinterpret_cast<const char*>(&a_q[a_0p_ptr + p + 64]), _MM_HINT_T0);
-                _mm_prefetch(reinterpret_cast<const char*>(&a_q[a_1p_ptr + p + 64]), _MM_HINT_T0);
-                _mm_prefetch(reinterpret_cast<const char*>(&a_q[a_2p_ptr + p + 64]), _MM_HINT_T0);
-                _mm_prefetch(reinterpret_cast<const char*>(&a_q[a_3p_ptr + p + 64]), _MM_HINT_T0);
-                _mm_prefetch(reinterpret_cast<const char*>(&b_q[offset_B + p + 64]), _MM_HINT_T0);
-                
-                __m256i a_0p_ymm = load<__m256i, std::int8_t>(&a_q[a_0p_ptr + p]);
-                __m256i a_1p_ymm = load<__m256i, std::int8_t>(&a_q[a_1p_ptr + p]);
-                __m256i a_2p_ymm = load<__m256i, std::int8_t>(&a_q[a_2p_ptr + p]);
-                __m256i a_3p_ymm = load<__m256i, std::int8_t>(&a_q[a_3p_ptr + p]);
-                __m256i b_p0_ymm = load<__m256i, std::int8_t>(&b_q[offset_B + p]);
-                
-                acc_00_ymm = madd(a_0p_ymm, b_p0_ymm, acc_00_ymm);
-                acc_10_ymm = madd(a_1p_ymm, b_p0_ymm, acc_10_ymm);
-                acc_20_ymm = madd(a_2p_ymm, b_p0_ymm, acc_20_ymm);
-                acc_30_ymm = madd(a_3p_ymm, b_p0_ymm, acc_30_ymm);
-            }
-            acc_00_sum = hsum(acc_00_ymm);
-            acc_10_sum = hsum(acc_10_ymm);
-            acc_20_sum = hsum(acc_20_ymm);
-            acc_30_sum = hsum(acc_30_ymm);
-        }
-        
-        if (end - p >= 4) {
-            for (; p + 3 < end; p += 4) {
-                for (int j = 0; j < 4; ++j) {
-                    int index = p + j;
-                    int8_t b_val = b_q[offset_B + index];
-                    acc_00_sum += static_cast<int32_t>(a_q[a_0p_ptr + index]) * static_cast<int32_t>(b_val);
-                    acc_10_sum += static_cast<int32_t>(a_q[a_1p_ptr + index]) * static_cast<int32_t>(b_val);
-                    acc_20_sum += static_cast<int32_t>(a_q[a_2p_ptr + index]) * static_cast<int32_t>(b_val);
-                    acc_30_sum += static_cast<int32_t>(a_q[a_3p_ptr + index]) * static_cast<int32_t>(b_val);
-                }
-            }
-        }
-        
-        for (; p < end; ++p) {
-            int8_t b_val = b_q[offset_B + p];
-            acc_00_sum += static_cast<int32_t>(a_q[a_0p_ptr + p]) * static_cast<int32_t>(b_val);
-            acc_10_sum += static_cast<int32_t>(a_q[a_1p_ptr + p]) * static_cast<int32_t>(b_val);
-            acc_20_sum += static_cast<int32_t>(a_q[a_2p_ptr + p]) * static_cast<int32_t>(b_val);
-            acc_30_sum += static_cast<int32_t>(a_q[a_3p_ptr + p]) * static_cast<int32_t>(b_val);
-        }
-        
-        const float a_s0 = a->s[(a_0p_ptr + begin) / GS];
-        const float a_s1 = a->s[(a_1p_ptr + begin) / GS];
-        const float a_s2 = a->s[(a_2p_ptr + begin) / GS];
-        const float a_s3 = a->s[(a_3p_ptr + begin) / GS];
-        const float b_s = b->s[(offset_B + begin) / GS];
-        
-        const float combined_scale = b_s;
-        c_00_reg += acc_00_sum * a_s0 * combined_scale;
-        c_10_reg += acc_10_sum * a_s1 * combined_scale;
-        c_20_reg += acc_20_sum * a_s2 * combined_scale;
-        c_30_reg += acc_30_sum * a_s3 * combined_scale;
-    }
-    
-    c[0 * ldc + 0] += c_00_reg;
-    c[1 * ldc + 0] += c_10_reg;
-    c[2 * ldc + 0] += c_20_reg;
-    c[3 * ldc + 0] += c_30_reg;
-}
-
-template <int GS, typename TA, typename TB, typename TC, int RM, int RN>
-using MicroKernelQ0Type = void (*)(int, const TA*, int, const TB*, int, TC*, int);
-
-template <int GS, typename TA, typename TB, typename TC, 
+template <int GS, typename TA, typename TX, typename TY, 
           int RM = 4, int RN = 1, 
-          int CM = 72, int CK = 256, int CN = 1020>
-class GEMM_Q0 {
+          int CM = 72, int CN = 1020>
+class GEMV_Q0 {
 private:
     const TA *const A_;
-    const TB *const B_;
-    TC *const C_;
+    const TX *const x_;
+    TY *const y_;
     const int lda_;
-    const int ldb_;
-    const int ldc_;
-    MicroKernelQ0Type<GS, TA, TB, TC, RM, RN> micro_kernel_;
-    
-    void PackMatrixA(int m, int k, const TA *A, int row_offset, int col_offset, 
-                TA *packA, int pack_offset) {
-        const auto &src_q = A->q;
-        const auto &src_s = A->s;
-        
-        using QType = typename decltype(A->q)::value_type;
-        const QType *src_q_row[RM];
-        
-        for (int i = 0; i < RM; ++i) {
-            if (i < m) {
-                src_q_row[i] = &src_q[(row_offset + i) * lda_ + col_offset];
-            } else {
-                src_q_row[i] = &src_q[(row_offset + 0) * lda_ + col_offset];
-            }
-        }
-        
-        for (int i = 0; i < RM; ++i) {
-            const QType *current_q_row = src_q_row[i];
-            const int abs_row_index = row_offset + (i < m ? i : 0);
-            int dst_q_base = pack_offset + i * k;
-            int p = 0;
-            for (; p + 31 < k; p += 32) {
-                __m256i data = load<__m256i, std::int8_t>(current_q_row + p);
-                store(&packA->q[dst_q_base + p], data);
-                for (int j = p; j < p + 32 && j < k; j += GS) {
-                    int dst_s_index = (dst_q_base + j) / GS;
-                    int src_s_index = (abs_row_index * lda_ + col_offset + j) / GS;
-                    packA->s[dst_s_index] = src_s[src_s_index];
-                }
-            }
-            
-            for (; p < k; ++p) {
-                int dst_q_index = dst_q_base + p;
-                int src_q_index = abs_row_index * lda_ + col_offset + p;
-                packA->q[dst_q_index] = current_q_row[p];
-                
-                if (p % GS == 0) {
-                    int dst_s_index = dst_q_index / GS;
-                    int src_s_index = src_q_index / GS;
-                    packA->s[dst_s_index] = src_s[src_s_index];
-                }
-            }
-        }
-    }
-
-    void PackMatrixB(int k, int n, const TB *B, int row_offset, int col_offset, 
-                TB *packB, int pack_offset) {
-        const auto &src_q = B->q;
-        const auto &src_s = B->s;
-        
-        int i = 0;
-        for (; i + 31 < k; i += 32) {
-            int src_base = (row_offset + i) * ldb_ + col_offset;
-            int dst_base = pack_offset + i;
-            __m256i data = load<__m256i, std::int8_t>(&src_q[src_base]);
-            store(&packB->q[dst_base], data);
-
-            for (int j = 0; j < 32 && i + j < k; j += GS) {
-                int src_s_index = (src_base + j) / GS;
-                int dst_s_index = (dst_base + j) / GS;
-                packB->s[dst_s_index] = src_s[src_s_index];
-            }
-        }
-        
-        for (; i < k; ++i) {
-            int src_q_index = (row_offset + i) * ldb_ + col_offset;
-            int dst_q_index = pack_offset + i;
-            packB->q[dst_q_index] = src_q[src_q_index];
-
-            if (i % GS == 0) {
-                int src_s_index = src_q_index / GS;
-                int dst_s_index = dst_q_index / GS;
-                packB->s[dst_s_index] = src_s[src_s_index];
-            }
-        }
-    }
 
 public:
-    GEMM_Q0(const TA *A, int lda, 
-            const TB *B, int ldb, 
-            TC *C, int ldc, 
-            MicroKernelQ0Type<GS, TA, TB, TC, RM, RN> micro_kernel) :
+    GEMV_Q0(const TA *A, int lda, 
+            const TX *x, TY *y) :
             A_(A), lda_(lda), 
-            B_(B), ldb_(ldb), 
-            C_(C), ldc_(ldc), 
-            micro_kernel_(micro_kernel) {};
-    void multiply(int m, int n, int k) {
-        int i, j, p;
-        int ic, ib, jc, jb, pc, pb;
-
-        // iterate row of A
-        #pragma omp parallel for private(ic, ib, pc, pb, i)
+            x_(x), y_(y) {};
+    
+    void multiply(int m, int n) {
+        int ic, jc;
+        // split by row block
         for (ic = 0; ic < m; ic += CM) {
-            ib = std::min(m - ic, CM);
-            // col of A, row of B
-            for (pc = 0; pc < k; pc += CK) {
-                pb = std::min(k - pc, CK);
-                TA *packed_A = malloc_aligned<TA>(ib * pb, 1, sizeof(TA));
-                TB *packed_B = malloc_aligned<TB>(pb * n, 1, sizeof(TB));
-                // n = 1, so do not need third loop of n
-                // pack matrix A
-                for (int i = 0; i < ib; i += RM) {
-                    PackMatrixA(
-                        std::min(ib - i, RM), pb, 
-                        A_,
-                        ic + i, pc, 
-                        packed_A,
-                        i * pb
-                    );
+            const int ib = std::min(m - ic, CM);
+            const int ie = ic + ib;
+
+            // split by column block
+            for (jc = 0; jc < n; jc += CN) {
+                const int jb = std::min(n - jc, CN);
+                const int je = jc + jb;
+
+                // handle current block with RM rows
+                for (int i = ic; i < ie; i += RM) {
+                    const int nrows = std::min(ie - i, RM);
+                    TY sum[RM] = {0};
+                    
+                    for (int group = 0; group < (jb + GS - 1) / GS; ++group) {
+                        const int begin = jc + group * GS;
+                        const int end = std::min(begin + GS, je);
+                        alignas(32) int32_t accum[RM] = {0}; 
+
+                        // init register array: y_j_ymm 
+                        __m256i y_j_ymm[RM];
+                        for (int r = 0; r < nrows; ++r) {
+                            y_j_ymm[r] = setzeros<__m256i>();
+                        }
+
+                        int j = begin;
+                        // process 32 elements at a time using SIMD
+                        for (; j + 31 < end; j += 32) {
+                            // prefetch x_->q and A_->q
+                            if (j + 128 < end) {
+                                _mm_prefetch(reinterpret_cast<const char*>(&x_->q[j + 128]), _MM_HINT_T0);
+                                for (int r = 0; r < nrows; ++r) {
+                                    _mm_prefetch(reinterpret_cast<const char*>(&A_->q[(i + r) * lda_ + j + 128]), _MM_HINT_T0);
+                                }
+                            }
+                            __m256i x_j_ymm0 = load<__m256i, std::int8_t>(&x_->q[j]);
+                            for (int r = 0; r < nrows; ++r) {
+                                __m256i a_rj_ymm0 = load<__m256i, std::int8_t>(&A_->q[(i + r) * lda_ + j]);
+                                y_j_ymm[r] = madd(a_rj_ymm0, x_j_ymm0, y_j_ymm[r]);
+                            }
+                        }
+
+                        // compute horizontal sum
+                        for (int r = 0; r < nrows; ++r) {
+                            accum[r] += hsum(y_j_ymm[r]);
+                        }
+                    
+                        // handle remaining elements
+                        for (; j < end; ++j) {
+                            int8_t xval = x_->q[j];
+                            for (int r = 0; r < nrows; ++r) {
+                                accum[r] += static_cast<int32_t>(A_->q[(i + r) * lda_ + j]) * 
+                                            static_cast<int32_t>(xval);
+                            }
+                        }
+                        
+                        // prefetch x_->s and A_->s
+                        _mm_prefetch(reinterpret_cast<const char*>(&x_->s[group / GS]), _MM_HINT_T0);
+                        for (int r = 0; r < nrows; r++) {
+                            _mm_prefetch(reinterpret_cast<const char*>(&A_->s[((i + r) * lda_ + begin) / GS]), _MM_HINT_T0);
+                        }
+                        const float xs = x_->s[begin / GS];
+                        for (int r = 0; r < nrows; ++r) {
+                            const float as = A_->s[((i + r) * lda_ + begin) / GS];
+                            sum[r] += static_cast<float>(accum[r]) * as * xs;
+                        }
+                    }
+                    for (int r = 0; r < nrows; ++r) {
+                        y_[i + r] += sum[r];
+                    }
                 }
-                // pack B
-                jb = n;
-                PackMatrixB(pb, jb, B_, pc, 0, packed_B, 0);
-                // micro kernel
-                for (int i = 0; i < ib; i += RM) {
-                    micro_kernel_(
-                        pb,
-                        packed_A,                  // A block
-                        i * pb,
-                        packed_B,                  // B block (n=1)
-                        0,
-                        &C_[(ic + i) * ldc_],      // C block
-                        ldc_
-                    );
-                }
-                free_aligned(packed_A);
-                free_aligned(packed_B);
             }
         }
     }
@@ -837,31 +690,14 @@ inline void matmul_pseudo(float* xout, const QuantizedTensorType *x, const Quant
 // by far the most amount of time is spent inside this little function
 // inputs to this function are both quantized
 inline void matmul(float* xout, const QuantizedTensorType *x, const QuantizedTensorType *w, int n, int d) {
-    const int GS = 32;
-    const int SMALL_MATRIX_THRESHOLD = 768 * 768;
-    if (n * d <= SMALL_MATRIX_THRESHOLD) {
-        matmul_pseudo(xout, x, w, n, d);
-        return ;
-    }
-
-    int m = d;
-    int k = n;
-    int nn = 1;
-    int lda = k;
-    int ldb = nn;
-    int ldc = nn;
-    constexpr int RM = 4, RN = 1, CM = 32, Ck = 128, CN = 1020;
-    float *C = malloc_aligned<float>(m, nn, sizeof(float));
-
-    MicroKernelQ0Type<GS, QuantizedTensorType, QuantizedTensorType, float, RM, RN> micro_kernel;
-    micro_kernel = &AddDot_4x1_Q0<GS, QuantizedTensorType, QuantizedTensorType, float, RM, RN>;
-    GEMM_Q0<GS, QuantizedTensorType, QuantizedTensorType, float, RM, RN, CM, Ck, CN> gemm_q0(
-        w, lda, x, ldb, C, ldc, 
-        micro_kernel
+    constexpr int GS = 32;
+    constexpr int RM = 4, RN = 1, CM = 72, CN = 256;
+    std::memset(xout, 0, d * sizeof(float));
+    
+    GEMV_Q0<GS, QuantizedTensorType, QuantizedTensorType, float, RM, RN, CM, CN> gemv_q0(
+        w, n, x, xout
     );
-    gemm_q0.multiply(m, nn, k);
-    std::memcpy(xout, C, m * nn * sizeof(float));
-    free(C);
+    gemv_q0.multiply(d, n);
 }
 
 #endif // UTILITY_HPP_ 
