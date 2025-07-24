@@ -5,7 +5,7 @@ This project is a C++ reimplementation derived from the original llama2.c projec
 ##### Key Features
 
 - **C++ Rewrite**: Complete reimplementation of the original C code using modern C++ (C++17)
-- **Optimized GEMM**: Custom General Matrix Multiply (GEMM) implementation optimized for both quantized and non-quantized models
+- **Optimized GEVM**: Custom General Matrix-Vector Multiply (GEVM) implementation optimized for both quantized and non-quantized models
 - **Dual Model Support**:
   - **`run.cpp/.hpp`**: Handles standard float models
   - **`runq.cpp/.hpp`**: Specialized for int8 quantized models with Q8_0 quantization
@@ -25,7 +25,7 @@ Our implementation provides performance gains over the original version through:
 - **Memory**: 8GB
 - **Environment**: Native Linux running on WSL2 platform
 
-The following benchmarks demonstrate the performance achieved with our optimized GEMM algorithm:
+The following benchmarks demonstrate the performance achieved with our optimized GEVM algorithm:
 
 | model | weights data type | tok/sec (optimized) | tok/sec (pseudo)| 
 |---------|-----------------|-------------------|-------------------|
@@ -34,7 +34,7 @@ The following benchmarks demonstrate the performance achieved with our optimized
 | stories110M     | float   |         41        |        17         |
 | stories15M-q80  | q8_0    |         345       |        373        |
 
-It's important to note that our optimized GEMM algorithm did not achieve significant performance improvements for these small-scale models. Particularly for the quantized version, we actually observed a performance decrease. We believe this is because the overhead of SIMD instructions and matrix blocking techniques outweighs the benefits for small matrix operations. We plan to continue testing on larger parameter-scale models where these optimizations are expected to provide more substantial benefits.
+It's important to note that our optimized GEVM algorithm did not achieve significant performance improvements for these small-scale models. Particularly for the quantized version, we actually observed a performance decrease. We believe this is because the overhead of SIMD instructions and matrix blocking techniques outweighs the benefits for small matrix operations. We plan to continue testing on larger parameter-scale models where these optimizations are expected to provide more substantial benefits.
 
 ##### Build & Usage
 
