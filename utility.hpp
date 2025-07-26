@@ -586,6 +586,7 @@ public:
     void multiply(int m, int n) {
         int ic, jc;
         // split by row block
+        #pragma omp parallel for
         for (ic = 0; ic < m; ic += CM) {
             const int ib = std::min(m - ic, CM);
             const int ie = ic + ib;
